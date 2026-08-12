@@ -81,6 +81,8 @@ out
 # Nuxt.js build / generate output
 .nuxt
 dist
+!dist/
+!dist/**
 .output
 
 # Gatsby files
@@ -141,3 +143,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Downstream Canary local reports
+.downstream-canary-results/

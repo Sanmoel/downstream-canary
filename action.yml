@@ -1,0 +1,51 @@
+name: Downstream Canary
+description: Test a candidate JavaScript library against explicitly selected, commit-pinned downstream consumers.
+author: Sanmoel
+inputs:
+  consumers:
+    description: Newline-separated OWNER/REPOSITORY@FULL_COMMIT_SHA entries.
+    required: false
+  config:
+    description: Optional path to .downstream-canary.yml for nonstandard projects.
+    required: false
+  candidate-root:
+    description: Candidate repository root relative to the checked-out workspace.
+    required: false
+    default: .
+  output-directory:
+    description: Directory for JSON and Markdown reports.
+    required: false
+    default: .downstream-canary-results
+  timeout-seconds:
+    description: Wall-clock timeout applied to each external command.
+    required: false
+    default: '600'
+  candidate-package-manager:
+    description: Optional candidate package-manager override (npm, pnpm, or yarn).
+    required: false
+  candidate-package-manager-version:
+    description: Optional exact candidate package-manager version.
+    required: false
+  candidate-build-command:
+    description: Optional candidate build command as a JSON argument array.
+    required: false
+  consumer-package-manager:
+    description: Optional package-manager override shared by configured consumers.
+    required: false
+  consumer-package-manager-version:
+    description: Optional exact package-manager version shared by configured consumers.
+    required: false
+  consumer-test-command:
+    description: Optional identical lane test command as a JSON argument array.
+    required: false
+outputs:
+  report-path:
+    description: Absolute path to the versioned JSON report.
+  regression-count:
+    description: Number of candidate-regression results.
+runs:
+  using: node24
+  main: dist/action.js
+branding:
+  icon: alert-triangle
+  color: yellow

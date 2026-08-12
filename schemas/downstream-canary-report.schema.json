@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Sanmoel/downstream-canary/main/schemas/downstream-canary-report.schema.json",
+  "title": "Downstream Canary report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "tool", "generatedAt", "candidate", "environment", "results", "summary"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "downstream-canary" },
+        "version": { "type": "string" }
+      }
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageName", "packageVersion", "tarballSha256", "contents"],
+      "properties": {
+        "packageName": { "type": "string" },
+        "packageVersion": { "type": "string" },
+        "tarballSha256": { "$ref": "#/$defs/sha256" },
+        "contents": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dockerImage", "nodeVersion"],
+      "properties": {
+        "dockerImage": { "type": "string" },
+        "nodeVersion": { "type": "string" }
+      }
+    },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": { "$ref": "#/$defs/result" }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compatible", "candidateRegressions", "inconclusivePreexisting", "candidateImprovements", "toolErrors", "exitCode"],
+      "properties": {
+        "compatible": { "type": "integer", "minimum": 0 },
+        "candidateRegressions": { "type": "integer", "minimum": 0 },
+        "inconclusivePreexisting": { "type": "integer", "minimum": 0 },
+        "candidateImprovements": { "type": "integer", "minimum": 0 },
+        "toolErrors": { "type": "integer", "minimum": 0 },
+        "exitCode": { "enum": [0, 1, 2] }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "installStatus", "testStatus", "durationMs"],
+      "properties": {
+        "status": { "enum": ["pass", "fail", "not-run"] },
+        "installStatus": { "enum": ["pass", "fail", "not-run"] },
+        "testStatus": { "enum": ["pass", "fail", "not-run"] },
+        "durationMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryUrl", "commit", "packageManager", "declaredPackageManagerVersion", "actualPackageManagerVersion", "nodeVersion", "operatingSystem", "architecture", "baseline", "candidate", "classification", "failurePhase", "durationMs", "candidatePackageName", "candidatePackageVersion", "candidateTarballSha256", "originalLockfileHash", "candidateLockfileHash", "dependencyFieldReplaced", "timeoutOrInfrastructureReason", "diagnosticExcerpt"],
+      "properties": {
+        "repositoryUrl": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "packageManager": { "oneOf": [{ "enum": ["npm", "pnpm", "yarn"] }, { "type": "null" }] },
+        "declaredPackageManagerVersion": { "type": ["string", "null"] },
+        "actualPackageManagerVersion": { "type": ["string", "null"] },
+        "nodeVersion": { "type": "string" },
+        "operatingSystem": { "const": "linux" },
+        "architecture": { "type": "string" },
+        "baseline": { "$ref": "#/$defs/phase" },
+        "candidate": { "$ref": "#/$defs/phase" },
+        "classification": { "enum": ["compatible", "candidate-regression", "inconclusive-preexisting", "candidate-improvement", "tool-error"] },
+        "failurePhase": {
+          "oneOf": [
+            {
+              "enum": [
+                "configuration",
+                "checkout",
+                "baseline-install",
+                "baseline-test",
+                "candidate-injection",
+                "candidate-lockfile",
+                "candidate-install",
+                "candidate-verification",
+                "candidate-test",
+                "docker",
+                "timeout"
+              ]
+            },
+            { "type": "null" }
+          ]
+        },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "candidatePackageName": { "type": "string" },
+        "candidatePackageVersion": { "type": "string" },
+        "candidateTarballSha256": { "$ref": "#/$defs/sha256" },
+        "originalLockfileHash": { "$ref": "#/$defs/nullableSha256" },
+        "candidateLockfileHash": { "$ref": "#/$defs/nullableSha256" },
+        "dependencyFieldReplaced": { "oneOf": [{ "enum": ["dependencies", "devDependencies", "optionalDependencies"] }, { "type": "null" }] },
+        "timeoutOrInfrastructureReason": { "type": ["string", "null"] },
+        "diagnosticExcerpt": { "type": "string", "maxLength": 8192 }
+      }
+    }
+  }
+}

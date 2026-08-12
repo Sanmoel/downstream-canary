@@ -1,0 +1,52 @@
+{
+  "name": "downstream-canary",
+  "version": "0.1.0",
+  "description": "Deterministic two-lane compatibility testing for JavaScript libraries and pinned downstream consumers.",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sanmoel/downstream-canary.git"
+  },
+  "bin": {
+    "downstream-canary": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "packageManager": "npm@11.17.0",
+  "scripts": {
+    "action:smoke": "node scripts/action-smoke.mjs",
+    "build": "npm run typecheck && npm run bundle",
+    "bundle": "node scripts/build.mjs",
+    "check:dist": "node scripts/check-dist.mjs",
+    "demo": "node dist/demo.js regression",
+    "demo:compatible": "node dist/demo.js compatible",
+    "demo:preexisting": "node dist/demo.js preexisting",
+    "integration": "vitest run tests/integration --testTimeout=900000 --hookTimeout=900000",
+    "lint": "eslint .",
+    "test": "vitest run tests/unit",
+    "test:all": "node scripts/test-all.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.3",
+    "ajv": "8.20.0",
+    "esbuild": "0.28.2",
+    "eslint": "10.8.1",
+    "jsonc-parser": "3.3.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.10",
+    "yaml": "2.9.0"
+  }
+}

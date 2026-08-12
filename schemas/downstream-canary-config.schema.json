@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Sanmoel/downstream-canary/main/schemas/downstream-canary-config.schema.json",
+  "title": "Downstream Canary configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "consumers"],
+  "properties": {
+    "version": { "const": 1 },
+    "candidate": { "$ref": "#/$defs/candidate" },
+    "defaults": { "$ref": "#/$defs/projectOverrides" },
+    "consumers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^(?:https://github\\.com/)?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$"
+          },
+          { "$ref": "#/$defs/consumer" }
+        ]
+      }
+    },
+    "outputDirectory": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+    },
+    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+  },
+  "$defs": {
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "projectOverrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
+        "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
+        "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
+        "installCommand": { "$ref": "#/$defs/command" },
+        "lockfileCommand": { "$ref": "#/$defs/command" },
+        "testCommand": { "$ref": "#/$defs/command" }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workingDirectory": { "const": "." },
+        "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
+        "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
+        "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
+        "installCommand": { "$ref": "#/$defs/command" },
+        "buildCommand": { "$ref": "#/$defs/command" }
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": { "type": "string", "pattern": "^(?:https://github\\.com/)?[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\\.git)?$" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "workingDirectory": { "const": "." },
+        "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
+        "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
+        "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
+        "installCommand": { "$ref": "#/$defs/command" },
+        "lockfileCommand": { "$ref": "#/$defs/command" },
+        "testCommand": { "$ref": "#/$defs/command" }
+      }
+    }
+  }
+}

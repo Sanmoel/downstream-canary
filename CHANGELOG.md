@@ -4,11 +4,11 @@ All notable changes to this project will be documented here. The format follows 
 
 ## [Unreleased]
 
-No changes are currently queued beyond the prepared v0.1.0 release candidate below.
+No changes are currently queued after v0.1.0.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-08-13
 
-This release has been prepared but not tagged, published to npm, or released on GitHub.
+This is the first public-pilot release. It is distributed as a GitHub Action pinned by full commit SHA; no npm package is published.
 
 ### Added
 
@@ -33,3 +33,4 @@ This release has been prepared but not tagged, published to npm, or released on 
 - Added generated bundled-dependency notices, an exact report schema contract, a successful bundled-Action harness, and a v0.1.0 release checklist.
 
 [Unreleased]: https://github.com/Sanmoel/downstream-canary/commits/main
+[0.1.0]: https://github.com/Sanmoel/downstream-canary/releases/tag/v0.1.0

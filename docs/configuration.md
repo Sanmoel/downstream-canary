@@ -18,7 +18,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: Sanmoel/downstream-canary@<FULL_COMMIT_SHA>
+      - uses: Sanmoel/downstream-canary@70d8fab1341fc9afe4c518fa54602e5551008844
         with:
           consumers: |
             acme/example-client@0123456789abcdef0123456789abcdef01234567

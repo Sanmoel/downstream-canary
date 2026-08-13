@@ -54,14 +54,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: Sanmoel/downstream-canary@<FULL_COMMIT_SHA>
+      - uses: Sanmoel/downstream-canary@70d8fab1341fc9afe4c518fa54602e5551008844
         with:
           consumers: |
             acme/example-client@0123456789abcdef0123456789abcdef01234567
             acme/example-tool@abcdef0123456789abcdef0123456789abcdef01
 ```
 
-Do not replace the full SHAs with branches or tags. Replace `<FULL_COMMIT_SHA>` only after the reviewed release-candidate commit is pushed. The Action fails closed unless it is running in GitHub Actions on a GitHub-hosted Linux runner, rejects `pull_request_target`, and accepts only an unset or local Unix-socket `DOCKER_HOST`. It needs no secrets and only `contents: read`.
+This example pins the reviewed v0.1.0 implementation commit. Keep the full commit SHA rather than replacing it with a branch or mutable tag. The Action fails closed unless it is running in GitHub Actions on a GitHub-hosted Linux runner, rejects `pull_request_target`, and accepts only an unset or local Unix-socket `DOCKER_HOST`. It needs no secrets and only `contents: read`.
 
 Action mode never reads `.downstream-canary.yml`. The Action invocation selects consumers, overrides, output location, and resource limits; conventional package-manager and test-script detection is restricted to the selected root package manifests and lockfiles. The resolved policy, its canonical SHA-256, and each exact test argument array are recorded in the report. The local CLI has a separate, explicit `--local --candidate-root <path>` boundary and may use YAML.
 

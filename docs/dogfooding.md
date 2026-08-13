@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: Sanmoel/downstream-canary@<FULL_COMMIT_SHA>
+      - uses: Sanmoel/downstream-canary@70d8fab1341fc9afe4c518fa54602e5551008844
         with:
           consumers: |
             OWNER/REAL_PUBLIC_CONSUMER@REPLACE_WITH_CONSUMER_FULL_SHA

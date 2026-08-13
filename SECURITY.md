@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes are provided for the latest released `0.1.x` version. Until a release exists, the default branch is the only maintained source.
+Security fixes are provided for the latest released `0.1.x` version. v0.1.0 is a public pilot: pin Action use to the full reviewed implementation SHA in the README because the default branch may contain unreleased changes.
 
 ## Reporting a vulnerability
 

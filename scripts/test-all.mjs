@@ -9,6 +9,7 @@ const commands = [
   ['npm', 'run', 'integration'],
   ['npm', 'run', 'action:smoke'],
   ['npm', 'run', 'check:dist'],
+  ['npm', 'run', 'check:notices'],
 ];
 
 for (const command of commands) {

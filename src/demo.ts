@@ -24,19 +24,15 @@ async function runCandidateTests(
   const cacheDirectory = join(fixtureRoot, 'demo-candidate-test-cache');
   try {
     await runner.ensureReady();
-    const warm = await runner.run({
-      workspace: candidateRoot,
-      cacheDirectory,
-      command: [
-        'corepack',
-        `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-        '--version',
-      ],
-      timeoutSeconds: 180,
-      network: 'bridge',
-      phase: 'demo-candidate-manager',
-    });
-    if (warm.exitCode !== 0) throw new Error(warm.output);
+    const managerProvision = await runner.provisionManager(
+      candidateRoot,
+      join(fixtureRoot, 'demo-candidate-manager-provision'),
+      {
+        name: 'npm',
+        requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS.npm,
+      },
+      180,
+    );
     const test = await runner.run({
       workspace: candidateRoot,
       cacheDirectory,
@@ -48,7 +44,7 @@ async function runCandidateTests(
       timeoutSeconds: 180,
       network: 'none',
       phase: 'demo-candidate-test',
-      corepackReadOnly: true,
+      managerProvision,
     });
     if (test.exitCode !== 0) throw new Error(test.output);
     process.stdout.write('1. Candidate library tests: pass\n');

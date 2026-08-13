@@ -17,15 +17,16 @@
     "schemas",
     "README.md",
     "LICENSE",
-    "SECURITY.md"
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES"
   ],
   "engines": {
     "node": ">=24.19.0 <25"
   },
   "packageManager": "npm@11.17.0",
   "scripts": {
-    "action:smoke": "node scripts/action-smoke.mjs",
-    "build": "npm run typecheck && npm run bundle",
+    "action:smoke": "vitest run tests/action --testTimeout=900000 --hookTimeout=900000",
+    "build": "npm run typecheck && npm run notices && npm run bundle",
     "bundle": "node scripts/build.mjs",
     "check:dist": "node scripts/check-dist.mjs",
     "demo": "node dist/demo.js regression",
@@ -33,6 +34,8 @@
     "demo:preexisting": "node dist/demo.js preexisting",
     "integration": "vitest run tests/integration --testTimeout=900000 --hookTimeout=900000",
     "lint": "eslint .",
+    "notices": "node scripts/generate-third-party-notices.mjs",
+    "check:notices": "node scripts/generate-third-party-notices.mjs --check",
     "test": "vitest run tests/unit",
     "test:all": "node scripts/test-all.mjs",
     "typecheck": "tsc --noEmit"

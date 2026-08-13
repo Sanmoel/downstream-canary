@@ -7,7 +7,6 @@ import {
   detectPackageManager,
   managerRunCommand,
   managerEnvironment,
-  managerVersionCommand,
   readManifest,
 } from './package-manager.js';
 import { validateCandidateTarball } from './tarball.js';
@@ -24,10 +23,12 @@ import {
   validatePackageVersion,
   validateSafePackageName,
 } from './validation.js';
+import type { RunBudget } from './budget.js';
 
 export interface BuiltCandidate {
   readonly artifact: CandidateArtifact;
   readonly manager: PackageManagerDetection;
+  readonly buildCommand: CommandArray | null;
 }
 
 const COPY_EXCLUSIONS = new Set([
@@ -65,38 +66,11 @@ function requireSuccess(result: ProcessResult, message: string): void {
   }
 }
 
-async function identifyManager(
-  docker: DockerRunner,
-  manager: PackageManagerDetection,
-  workspace: string,
-  cacheDirectory: string,
-  timeoutSeconds: number,
-): Promise<PackageManagerDetection> {
-  const versionResult = await docker.run({
-    workspace,
-    cacheDirectory,
-    command: managerVersionCommand(manager),
-    timeoutSeconds,
-    network: 'bridge',
-    phase: 'candidate-manager-version',
-  });
-  requireSuccess(versionResult, `Unable to run ${manager.name}@${manager.requestedVersion}.`);
-  const actualVersion = versionResult.stdout.trim();
-  if (actualVersion !== manager.requestedVersion) {
-    throw new CanaryError(
-      'tooling',
-      'configuration',
-      `Requested ${manager.name}@${manager.requestedVersion}, but ${actualVersion} executed.`,
-    );
-  }
-  return { ...manager, actualVersion };
-}
-
 export async function buildCandidate(
   config: CandidateConfig,
   docker: DockerRunner,
   temporaryRoot: string,
-  timeoutSeconds: number,
+  budget: RunBudget,
 ): Promise<BuiltCandidate> {
   const sourceRoot = resolve(config.root);
   const workingDirectory = validateRelativeWorkingDirectory(config.workingDirectory);
@@ -188,23 +162,25 @@ export async function buildCandidate(
     config,
     false,
   );
-  manager = await identifyManager(
-    docker,
-    manager,
+  const managerProvision = await docker.provisionManager(
     project,
-    cacheDirectory,
-    timeoutSeconds,
+    join(temporaryRoot, 'candidate-manager-provision'),
+    manager,
+    budget.timeoutSeconds('candidate package-manager provisioning'),
+    budget,
   );
+  manager = { ...manager, actualVersion: managerProvision.version };
 
   const install = await docker.run({
     workspace: project,
     cacheDirectory,
     command: manager.immutableInstallCommand,
-    timeoutSeconds,
+    timeoutSeconds: budget.timeoutSeconds('candidate dependency installation'),
     network: 'bridge',
     phase: 'candidate-build-install',
-    corepackReadOnly: true,
+    managerProvision,
     extraEnvironment: managerEnvironment(manager),
+    budget,
   });
   requireSuccess(install, 'Candidate dependency installation failed.');
 
@@ -219,33 +195,30 @@ export async function buildCandidate(
       workspace: project,
       cacheDirectory,
       command: buildCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds('candidate build'),
       network: 'none',
       phase: 'candidate-build',
-      corepackReadOnly: true,
+      managerProvision,
       extraEnvironment: managerEnvironment(manager),
+      budget,
     });
     requireSuccess(build, `Candidate build failed: ${diagnosticExcerpt(build.output)}`);
   }
 
-  if (manager.name !== 'npm') {
-    const npmWarmup = await docker.run({
-      workspace: project,
-      cacheDirectory,
-      command: [
-        'corepack',
-        `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-        '--version',
-      ],
-      timeoutSeconds,
-      network: 'bridge',
-      phase: 'candidate-pack-manager',
-    });
-    requireSuccess(
-      npmWarmup,
-      `Unable to provision npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm} for candidate packing.`,
-    );
-  }
+  const npmProvision =
+    manager.name === 'npm' &&
+    manager.requestedVersion === DEFAULT_PACKAGE_MANAGER_VERSIONS.npm
+      ? managerProvision
+      : await docker.provisionManager(
+          project,
+          join(temporaryRoot, 'candidate-pack-manager-provision'),
+          {
+            name: 'npm',
+            requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS.npm,
+          },
+          budget.timeoutSeconds('candidate pack-manager provisioning'),
+          budget,
+        );
 
   const pack = await docker.run({
     workspace: project,
@@ -258,11 +231,12 @@ export async function buildCandidate(
       '--pack-destination',
       '/canary-cache/packed',
     ],
-    timeoutSeconds,
+    timeoutSeconds: budget.timeoutSeconds('candidate pack'),
     network: 'none',
     phase: 'candidate-pack',
-    corepackReadOnly: true,
+    managerProvision: npmProvision,
     extraEnvironment: { npm_config_ignore_scripts: 'false' },
+    budget,
   });
   requireSuccess(pack, 'Candidate npm pack failed.');
   const outputMetadata = await lstat(outputDirectory).catch((error: unknown) => {
@@ -294,5 +268,5 @@ export async function buildCandidate(
     expectedName: manifest.name,
     expectedVersion: manifest.version,
   });
-  return { artifact, manager };
+  return { artifact, manager, buildCommand: buildCommand ?? null };
 }

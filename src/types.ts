@@ -1,6 +1,8 @@
 import type { REPORT_SCHEMA_VERSION } from './constants.js';
+import type { RunBudget } from './budget.js';
 
 export type PackageManagerName = 'npm' | 'pnpm' | 'yarn';
+export type ExecutionMode = 'github-action' | 'local-cli' | 'library';
 export type DependencyField =
   | 'dependencies'
   | 'devDependencies'
@@ -15,8 +17,6 @@ export interface ProjectOverrides {
   readonly packageManager?: PackageManagerName;
   readonly packageManagerVersion?: string;
   readonly lockfile?: string;
-  readonly installCommand?: CommandArray;
-  readonly lockfileCommand?: CommandArray;
   readonly testCommand?: CommandArray;
   readonly buildCommand?: CommandArray;
 }
@@ -38,8 +38,10 @@ export interface RunConfig {
   readonly consumers: readonly ConsumerSpec[];
   readonly outputDirectory: string;
   readonly timeoutSeconds: number;
+  readonly runTimeoutSeconds?: number;
   readonly dockerExecutable: string;
   readonly dockerImage: string;
+  readonly executionMode?: ExecutionMode;
 }
 
 export interface PackageManagerDetection {
@@ -52,6 +54,13 @@ export interface PackageManagerDetection {
   readonly immutableInstallCommand: CommandArray;
   readonly lockfileCommand: CommandArray;
   readonly testCommand: CommandArray;
+}
+
+export interface ManagerProvision {
+  readonly name: PackageManagerName;
+  readonly version: string;
+  readonly corepackDirectory: string;
+  readonly sha256: string;
 }
 
 export interface CandidateArtifact {
@@ -75,6 +84,15 @@ export type CompatibilityClassification =
 
 export type ResultClassification = CompatibilityClassification | 'tool-error';
 
+export type CandidateInstallFailureAttribution =
+  | 'dependency-resolution'
+  | 'lifecycle-incompatibility'
+  | 'registry'
+  | 'network'
+  | 'corepack'
+  | 'docker'
+  | 'unknown';
+
 export type FailurePhase =
   | 'configuration'
   | 'checkout'
@@ -95,12 +113,18 @@ export interface PhaseResult {
   readonly durationMs: number;
 }
 
+export interface GeneratedPath {
+  readonly path: string;
+  readonly sizeBytes: number;
+}
+
 export interface ConsumerResult {
   readonly repositoryUrl: string;
   readonly commit: string;
   readonly packageManager: PackageManagerName | null;
   readonly declaredPackageManagerVersion: string | null;
   readonly actualPackageManagerVersion: string | null;
+  readonly requestedPackageManagerVersion: string | null;
   readonly nodeVersion: string;
   readonly operatingSystem: 'linux';
   readonly architecture: string;
@@ -117,6 +141,40 @@ export interface ConsumerResult {
   readonly dependencyFieldReplaced: DependencyField | null;
   readonly timeoutOrInfrastructureReason: string | null;
   readonly diagnosticExcerpt: string;
+  /** One trusted argument array is executed unchanged in both lanes. */
+  readonly executedTestCommand: CommandArray | null;
+  readonly candidateInstallFailureAttribution: CandidateInstallFailureAttribution | null;
+  readonly packageManagerProvisionSha256: string | null;
+  readonly generatedPaths: {
+    readonly baseline: readonly GeneratedPath[];
+    readonly candidate: readonly GeneratedPath[];
+  };
+}
+
+export interface ResolvedPolicyConsumer {
+  readonly repositoryUrl: string;
+  readonly commit: string;
+  readonly packageManager: PackageManagerName | null;
+  readonly packageManagerVersion: string | null;
+  readonly testCommand: CommandArray | null;
+}
+
+export interface ResolvedPolicy {
+  readonly version: 1;
+  readonly source: ExecutionMode;
+  readonly candidate: {
+    readonly workingDirectory: string;
+    readonly packageManager: PackageManagerName | null;
+    readonly packageManagerVersion: string | null;
+    readonly buildCommand: CommandArray | null;
+  };
+  readonly consumers: readonly ResolvedPolicyConsumer[];
+  readonly limits: {
+    readonly commandTimeoutSeconds: number;
+    readonly wholeRunTimeoutSeconds: number;
+    readonly generatedFileCountPerLane: number;
+    readonly generatedBytesPerLane: number;
+  };
 }
 
 export interface CanaryReport {
@@ -126,6 +184,10 @@ export interface CanaryReport {
     readonly version: string;
   };
   readonly generatedAt: string;
+  readonly policy: {
+    readonly sha256: string;
+    readonly resolved: ResolvedPolicy;
+  };
   readonly candidate: {
     readonly packageName: string;
     readonly packageVersion: string;
@@ -164,8 +226,9 @@ export interface DockerRunOptions {
   readonly cacheDirectory?: string;
   readonly command: CommandArray;
   readonly timeoutSeconds: number;
+  readonly budget?: RunBudget;
   readonly network: 'bridge' | 'none';
   readonly phase: string;
-  readonly corepackReadOnly?: boolean;
+  readonly managerProvision?: ManagerProvision;
   readonly extraEnvironment?: Readonly<Record<string, string>> | undefined;
 }

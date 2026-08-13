@@ -10,8 +10,17 @@ import { isSecretName } from './util/logs.js';
 import type {
   CommandArray,
   DockerRunOptions,
+  ManagerProvision,
+  PackageManagerDetection,
   ProcessResult,
 } from './types.js';
+import { validateLocalDockerHost } from './action-environment.js';
+import { snapshotTree } from './util/files.js';
+import { stableStringify } from './util/stable-json.js';
+import { sha256 } from './util/hash.js';
+import { managerVersionCommand } from './package-manager.js';
+import type { RunBudget } from './budget.js';
+import { diagnosticExcerpt } from './util/logs.js';
 
 export interface ContainerRuntimeInfo {
   readonly nodeVersion: string;
@@ -19,15 +28,67 @@ export interface ContainerRuntimeInfo {
   readonly architecture: string;
 }
 
+export interface DockerRunnerOptions {
+  readonly allowContextDiscovery?: boolean;
+  readonly requireLocalDocker?: boolean;
+  readonly runId?: string;
+  readonly budget?: RunBudget;
+}
+
+export const DOCKER_RUN_LABEL = 'io.github.sanmoel.downstream-canary.run-id';
+
 export class DockerRunner {
   readonly #executable: string;
   readonly #image: string;
   #configDirectory: string | undefined;
-  #dockerHost: string | undefined = process.env.DOCKER_HOST;
+  #dockerHost: string | undefined;
+  readonly #allowContextDiscovery: boolean;
+  readonly #runId: string;
+  readonly #budget: RunBudget | undefined;
+  readonly #activeContainers = new Set<string>();
+  readonly #cleanupInFlight = new Map<string, Promise<void>>();
+  #ready = false;
+  #disposePromise: Promise<void> | undefined;
+  #closing = false;
 
-  public constructor(executable: string, image: string) {
+  public constructor(
+    executable: string,
+    image: string,
+    options: DockerRunnerOptions = {},
+  ) {
     this.#executable = executable;
     this.#image = image;
+    this.#allowContextDiscovery = options.allowContextDiscovery ?? true;
+    this.#runId = options.runId ?? randomUUID();
+    if (!/^[0-9a-f-]{8,64}$/i.test(this.#runId)) {
+      throw new CanaryError(
+        'configuration',
+        'docker',
+        'Docker run IDs must contain only hexadecimal characters and hyphens.',
+      );
+    }
+    this.#budget = options.budget;
+    this.#dockerHost = options.requireLocalDocker
+      ? validateLocalDockerHost(process.env.DOCKER_HOST)
+      : process.env.DOCKER_HOST;
+  }
+
+  public get runId(): string {
+    return this.#runId;
+  }
+
+  #timeoutMs(requestedMs: number, phase: string): number {
+    return this.#budget?.timeoutMilliseconds(phase, requestedMs) ?? requestedMs;
+  }
+
+  #assertOpen(): void {
+    if (this.#closing) {
+      throw new CanaryError(
+        'infrastructure',
+        'docker',
+        'Docker runner cleanup has started; no new containers may be created.',
+      );
+    }
   }
 
   async #environment(): Promise<Record<string, string>> {
@@ -39,12 +100,18 @@ export class DockerRunner {
   }
 
   public async ensureReady(): Promise<void> {
+    this.#assertOpen();
     let environment = await this.#environment();
     let version = await runProcess(
       [this.#executable, 'version', '--format', '{{.Server.Version}}'],
-      { environment, timeoutMs: 30_000 },
+      { environment, timeoutMs: this.#timeoutMs(30_000, 'Docker readiness check') },
     );
-    if (version.exitCode !== 0 && !this.#dockerHost && process.env.HOME) {
+    if (
+      version.exitCode !== 0 &&
+      !this.#dockerHost &&
+      this.#allowContextDiscovery &&
+      process.env.HOME
+    ) {
       const context = await runProcess(
         [
           this.#executable,
@@ -55,7 +122,7 @@ export class DockerRunner {
         ],
         {
           environment: safeHostEnvironment({ HOME: process.env.HOME }),
-          timeoutMs: 30_000,
+          timeoutMs: this.#timeoutMs(30_000, 'Docker context discovery'),
         },
       );
       const discoveredHost = context.stdout.trim();
@@ -64,7 +131,10 @@ export class DockerRunner {
         environment = await this.#environment();
         version = await runProcess(
           [this.#executable, 'version', '--format', '{{.Server.Version}}'],
-          { environment, timeoutMs: 30_000 },
+          {
+            environment,
+            timeoutMs: this.#timeoutMs(30_000, 'Docker readiness check'),
+          },
         );
       }
     }
@@ -78,12 +148,12 @@ export class DockerRunner {
     }
     const inspect = await runProcess(
       [this.#executable, 'image', 'inspect', this.#image],
-      { environment, timeoutMs: 30_000 },
+      { environment, timeoutMs: this.#timeoutMs(30_000, 'Docker image inspection') },
     );
     if (inspect.exitCode !== 0) {
       const pull = await runProcess([this.#executable, 'pull', this.#image], {
         environment,
-        timeoutMs: 10 * 60_000,
+        timeoutMs: this.#timeoutMs(10 * 60_000, 'Docker image pull'),
       });
       if (pull.exitCode !== 0) {
         throw new CanaryError(
@@ -94,15 +164,100 @@ export class DockerRunner {
         );
       }
     }
+    this.#ready = true;
+  }
+
+  async #provisionDigest(directory: string): Promise<string> {
+    const snapshot = await snapshotTree(directory, new Set());
+    return sha256(stableStringify([...snapshot.entries()]));
+  }
+
+  public async verifyManagerProvision(
+    provision: ManagerProvision,
+  ): Promise<void> {
+    const actual = await this.#provisionDigest(provision.corepackDirectory);
+    if (actual !== provision.sha256) {
+      throw new CanaryError(
+        'infrastructure',
+        'docker',
+        `The verified ${provision.name}@${provision.version} manager provision changed after it was sealed read-only.`,
+      );
+    }
+  }
+
+  public async provisionManager(
+    workspace: string,
+    cacheDirectory: string,
+    manager: Pick<PackageManagerDetection, 'name' | 'requestedVersion'>,
+    timeoutSeconds: number,
+    budget?: RunBudget,
+  ): Promise<ManagerProvision> {
+    this.#assertOpen();
+    const corepackDirectory = join(cacheDirectory, 'corepack');
+    await mkdir(corepackDirectory, { recursive: true });
+    const result = await this.#run(
+      {
+        workspace,
+        cacheDirectory,
+        command: managerVersionCommand(manager),
+        timeoutSeconds,
+        network: 'bridge',
+        phase: `provision-${manager.name}-${manager.requestedVersion}`,
+        ...(budget ? { budget } : {}),
+      },
+      corepackDirectory,
+      false,
+    );
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new CanaryError(
+        'infrastructure',
+        result.timedOut ? 'timeout' : 'docker',
+        `Unable to provision ${manager.name}@${manager.requestedVersion}.`,
+        { diagnostic: result.output },
+      );
+    }
+    const actualVersion = result.stdout.trim();
+    if (actualVersion !== manager.requestedVersion) {
+      throw new CanaryError(
+        'tooling',
+        'configuration',
+        `Requested ${manager.name}@${manager.requestedVersion}, but ${actualVersion} executed.`,
+      );
+    }
+    return {
+      name: manager.name,
+      version: actualVersion,
+      corepackDirectory,
+      sha256: await this.#provisionDigest(corepackDirectory),
+    };
   }
 
   public async run(options: DockerRunOptions): Promise<ProcessResult> {
+    this.#assertOpen();
+    const cacheDirectory =
+      options.cacheDirectory ?? join(options.workspace, '.downstream-canary', 'runtime-cache');
+    const corepackDirectory =
+      options.managerProvision?.corepackDirectory ?? join(cacheDirectory, 'empty-corepack');
+    await mkdir(corepackDirectory, { recursive: true });
+    if (options.managerProvision) {
+      await this.verifyManagerProvision(options.managerProvision);
+    }
+    const result = await this.#run(options, corepackDirectory, true);
+    if (options.managerProvision) {
+      await this.verifyManagerProvision(options.managerProvision);
+    }
+    return result;
+  }
+
+  async #run(
+    options: DockerRunOptions,
+    corepackDirectory: string,
+    corepackReadOnly: boolean,
+  ): Promise<ProcessResult> {
     const cacheDirectory =
       options.cacheDirectory ?? join(options.workspace, '.downstream-canary', 'runtime-cache');
     const packageCacheDirectory = join(cacheDirectory, 'package-cache');
-    const corepackDirectory = join(cacheDirectory, 'corepack');
     await mkdir(packageCacheDirectory, { recursive: true });
-    await mkdir(corepackDirectory, { recursive: true });
     const name = `downstream-canary-${options.phase.replace(/[^a-z0-9_.-]/gi, '-')}-${randomUUID()}`;
     const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
     const gid = typeof process.getgid === 'function' ? process.getgid() : 1000;
@@ -117,8 +272,14 @@ export class DockerRunner {
       CI: '1',
       HOME: '/tmp/home',
       COREPACK_HOME: '/corepack-home',
+      COREPACK_ENV_FILE: '0',
+      COREPACK_DEFAULT_TO_LATEST: '0',
+      COREPACK_ENABLE_AUTO_PIN: '0',
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0',
+      COREPACK_NPM_REGISTRY: 'https://registry.npmjs.org',
       npm_config_cache: '/canary-cache/npm',
       npm_config_userconfig: '/dev/null',
+      npm_config_registry: 'https://registry.npmjs.org',
       XDG_CACHE_HOME: '/canary-cache/xdg',
       NO_COLOR: '1',
       ...options.extraEnvironment,
@@ -140,6 +301,8 @@ export class DockerRunner {
       '--init',
       '--name',
       name,
+      '--label',
+      `${DOCKER_RUN_LABEL}=${this.#runId}`,
       '--user',
       `${uid}:${gid}`,
       '--cap-drop',
@@ -164,7 +327,7 @@ export class DockerRunner {
       '--mount',
       `type=bind,src=${packageCacheDirectory},dst=/canary-cache`,
       '--mount',
-      `type=bind,src=${corepackDirectory},dst=/corepack-home${options.corepackReadOnly ? ',readonly' : ''}`,
+      `type=bind,src=${corepackDirectory},dst=/corepack-home${corepackReadOnly ? ',readonly' : ''}`,
       '--workdir',
       '/workspace',
     ];
@@ -173,12 +336,20 @@ export class DockerRunner {
     }
     args.push(this.#image, ...options.command);
     const command = args as unknown as CommandArray;
-    const result = await runProcess(command, {
-      environment: await this.#environment(),
-      timeoutMs: options.timeoutSeconds * 1000,
-    });
-
-    if (result.timedOut || result.exitCode !== 0) {
+    this.#activeContainers.add(name);
+    let result: ProcessResult;
+    try {
+      result = await runProcess(command, {
+        environment: await this.#environment(),
+        timeoutMs: this.#timeoutMs(
+          options.budget?.timeoutMilliseconds(
+            `Docker phase ${options.phase}`,
+            options.timeoutSeconds * 1000,
+          ) ?? options.timeoutSeconds * 1000,
+          `Docker phase ${options.phase}`,
+        ),
+      });
+    } finally {
       await this.#cleanupContainer(name);
     }
     if (!result.timedOut && (result.exitCode === null || result.exitCode === 125)) {
@@ -192,16 +363,161 @@ export class DockerRunner {
     return result;
   }
 
-  async #cleanupContainer(name: string): Promise<void> {
+  async #inspectContainer(name: string): Promise<boolean> {
     const environment = await this.#environment();
-    await runProcess([this.#executable, 'kill', name], {
-      environment,
-      timeoutMs: 10_000,
+    const result = await runProcess(
+      [this.#executable, 'container', 'inspect', '--format', '{{.Id}}', name],
+      {
+        environment,
+        timeoutMs: 10_000,
+      },
+    );
+    if (result.exitCode === 0 && !result.timedOut) return true;
+    if (
+      !result.timedOut &&
+      result.exitCode !== null &&
+      /no such (?:object|container)/i.test(result.output)
+    ) {
+      return false;
+    }
+    throw new CanaryError(
+      'infrastructure',
+      'docker',
+      `Unable to verify cleanup of container ${name}.`,
+      { diagnostic: result.output },
+    );
+  }
+
+  async #cleanupContainerAttempt(name: string): Promise<void> {
+    const diagnostics: string[] = [];
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      if (!(await this.#inspectContainer(name))) {
+        this.#activeContainers.delete(name);
+        return;
+      }
+      const environment = await this.#environment();
+      const kill = await runProcess([this.#executable, 'kill', name], {
+        environment,
+        timeoutMs: 10_000,
+      });
+      if (
+        kill.exitCode !== 0 &&
+        !/no such (?:object|container)|is not running/i.test(kill.output)
+      ) {
+        diagnostics.push(`kill attempt ${attempt}: ${kill.output}`);
+      }
+      const remove = await runProcess(
+        [this.#executable, 'rm', '--force', name],
+        {
+          environment,
+          timeoutMs: 10_000,
+        },
+      );
+      if (
+        remove.exitCode !== 0 &&
+        !/no such (?:object|container)/i.test(remove.output)
+      ) {
+        diagnostics.push(`remove attempt ${attempt}: ${remove.output}`);
+      }
+      if (!(await this.#inspectContainer(name))) {
+        this.#activeContainers.delete(name);
+        return;
+      }
+      await new Promise<void>((resolveDelay) => {
+        setTimeout(resolveDelay, 100 * attempt);
+      });
+    }
+    throw new CanaryError(
+      'infrastructure',
+      'docker',
+      `Container ${name} remained after three verified cleanup attempts.`,
+      { diagnostic: diagnosticExcerpt(diagnostics.join('\n')) },
+    );
+  }
+
+  async #cleanupContainer(name: string): Promise<void> {
+    const existing = this.#cleanupInFlight.get(name);
+    if (existing) return await existing;
+    const cleanup = this.#cleanupContainerAttempt(name).finally(() => {
+      this.#cleanupInFlight.delete(name);
     });
-    await runProcess([this.#executable, 'rm', '--force', name], {
-      environment,
-      timeoutMs: 10_000,
-    });
+    this.#cleanupInFlight.set(name, cleanup);
+    return await cleanup;
+  }
+
+  async #containersForRun(): Promise<readonly string[]> {
+    const result = await runProcess(
+      [
+        this.#executable,
+        'container',
+        'ls',
+        '--all',
+        '--quiet',
+        '--filter',
+        `label=${DOCKER_RUN_LABEL}=${this.#runId}`,
+      ],
+      {
+        environment: await this.#environment(),
+        timeoutMs: 10_000,
+      },
+    );
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new CanaryError(
+        'infrastructure',
+        'docker',
+        'Unable to perform the final run-label container sweep.',
+        { diagnostic: result.output },
+      );
+    }
+    const identifiers = result.stdout
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (identifiers.some((identifier) => !/^[0-9a-f]{12,64}$/i.test(identifier))) {
+      throw new CanaryError(
+        'infrastructure',
+        'docker',
+        'Docker returned an invalid container identifier during cleanup.',
+      );
+    }
+    return identifiers;
+  }
+
+  async #dispose(): Promise<void> {
+    let cleanupError: unknown;
+    try {
+      if (this.#ready || this.#activeContainers.size > 0) {
+        for (const name of [...this.#activeContainers]) {
+          await this.#cleanupContainer(name);
+        }
+        for (const identifier of await this.#containersForRun()) {
+          await this.#cleanupContainer(identifier);
+        }
+        const remaining = await this.#containersForRun();
+        if (remaining.length > 0) {
+          throw new CanaryError(
+            'infrastructure',
+            'docker',
+            `Final cleanup left ${remaining.length} run-labeled container(s).`,
+          );
+        }
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (this.#configDirectory) {
+      await rm(this.#configDirectory, { recursive: true, force: true });
+      this.#configDirectory = undefined;
+    }
+    if (cleanupError) {
+      throw cleanupError instanceof Error
+        ? cleanupError
+        : new CanaryError(
+            'infrastructure',
+            'docker',
+            'Container cleanup failed with a non-error value.',
+          );
+    }
   }
 
   public async runtimeInfo(workspace: string, timeoutSeconds: number): Promise<ContainerRuntimeInfo> {
@@ -241,9 +557,10 @@ export class DockerRunner {
   }
 
   public async dispose(): Promise<void> {
-    if (this.#configDirectory) {
-      await rm(this.#configDirectory, { recursive: true, force: true });
-      this.#configDirectory = undefined;
+    if (!this.#disposePromise) {
+      this.#closing = true;
+      this.#disposePromise = this.#dispose();
     }
+    await this.#disposePromise;
   }
 }

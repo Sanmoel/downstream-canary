@@ -28,7 +28,8 @@
       "minLength": 1,
       "pattern": "^(?!/)(?!\\.$)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
     },
-    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+    "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+    "runTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 21600 }
   },
   "$defs": {
     "command": {
@@ -43,8 +44,6 @@
         "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
         "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
         "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
-        "installCommand": { "$ref": "#/$defs/command" },
-        "lockfileCommand": { "$ref": "#/$defs/command" },
         "testCommand": { "$ref": "#/$defs/command" }
       }
     },
@@ -56,7 +55,6 @@
         "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
         "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
         "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
-        "installCommand": { "$ref": "#/$defs/command" },
         "buildCommand": { "$ref": "#/$defs/command" }
       }
     },
@@ -71,8 +69,6 @@
         "packageManager": { "enum": ["npm", "pnpm", "yarn"] },
         "packageManagerVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?$" },
         "lockfile": { "enum": ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] },
-        "installCommand": { "$ref": "#/$defs/command" },
-        "lockfileCommand": { "$ref": "#/$defs/command" },
         "testCommand": { "$ref": "#/$defs/command" }
       }
     }

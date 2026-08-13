@@ -4,10 +4,11 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createFixtureWorld, type FixtureWorld } from '../../fixtures/factory.js';
 import { RUNNER_IMAGE } from '../../src/constants.js';
-import { DockerRunner } from '../../src/docker.js';
+import { DOCKER_RUN_LABEL, DockerRunner } from '../../src/docker.js';
 import { runCanary, type CanaryRun } from '../../src/engine.js';
 import { snapshotTree } from '../../src/util/files.js';
 import { FIXTURE_LOCAL_PATH } from '../../src/types.js';
+import { runProcess, safeHostEnvironment } from '../../src/process.js';
 
 const dockerExecutable = process.env.DOWNSTREAM_CANARY_DOCKER ?? 'docker';
 let world: FixtureWorld;
@@ -37,7 +38,12 @@ beforeAll(async () => {
   }
   compatibleRun = await runCanary({
     candidate: world.candidateCompatible,
-    consumers: consumers(['npm-compatible', 'pnpm-compatible', 'yarn-compatible']),
+    consumers: consumers([
+      'npm-compatible',
+      'pnpm-compatible',
+      'yarn-compatible',
+      'npm-coverage',
+    ]),
     outputDirectory: join(world.root, 'reports-compatible'),
     timeoutSeconds: 180,
     dockerExecutable,
@@ -70,7 +76,7 @@ afterAll(async () => {
 describe('end-to-end package-manager fixture matrix', () => {
   it.each(['npm', 'pnpm', 'yarn'] as const)('%s compatible is a verified nonblocking comparison', (manager) => {
     const item = result(compatibleRun, `${manager}-compatible`);
-    expect(item).toMatchObject({
+    expect(item, item.diagnosticExcerpt).toMatchObject({
       packageManager: manager,
       baseline: { status: 'pass', installStatus: 'pass', testStatus: 'pass' },
       candidate: { status: 'pass', installStatus: 'pass', testStatus: 'pass' },
@@ -84,7 +90,8 @@ describe('end-to-end package-manager fixture matrix', () => {
   });
 
   it.each(['npm', 'pnpm', 'yarn'] as const)('%s candidate regression blocks', (manager) => {
-    expect(result(breakingRun, `${manager}-regression`)).toMatchObject({
+    const item = result(breakingRun, `${manager}-regression`);
+    expect(item, item.diagnosticExcerpt).toMatchObject({
       packageManager: manager,
       baseline: { status: 'pass' },
       candidate: { status: 'fail' },
@@ -106,6 +113,17 @@ describe('end-to-end package-manager fixture matrix', () => {
     });
   });
 
+  it('allows and records bounded coverage output in both lanes', () => {
+    const item = result(compatibleRun, 'npm-coverage');
+    expect(item).toMatchObject({ classification: 'compatible' });
+    expect(item.generatedPaths.baseline).toEqual([
+      { path: 'coverage/summary.json', sizeBytes: 17 },
+    ]);
+    expect(item.generatedPaths.candidate).toEqual([
+      { path: 'coverage/summary.json', sizeBytes: 17 },
+    ]);
+  });
+
   it('treats injection failure as a tool error', () => {
     expect(result(breakingRun, 'npm-injection-failure')).toMatchObject({
       classification: 'tool-error',
@@ -113,7 +131,7 @@ describe('end-to-end package-manager fixture matrix', () => {
     });
   });
 
-  it('proves secret omission, test-time network isolation, and read-only root and manager filesystems', () => {
+  it('proves secret omission in build/install/test, test-time network isolation, and read-only root and manager filesystems', () => {
     expect(result(breakingRun, 'npm-security')).toMatchObject({
       baseline: { status: 'pass' },
       candidate: { status: 'pass' },
@@ -152,6 +170,7 @@ describe('end-to-end package-manager fixture matrix', () => {
 describe('Docker timeout cleanup', () => {
   it('terminates the complete container process tree', async () => {
     const runner = new DockerRunner(dockerExecutable, RUNNER_IMAGE);
+    const runId = runner.runId;
     const workspace = join(world.root, 'timeout-workspace');
     const marker = join(workspace, 'child-survived');
     await import('node:fs/promises').then(({ mkdir }) => mkdir(workspace, { recursive: true }));
@@ -175,6 +194,25 @@ describe('Docker timeout cleanup', () => {
     } finally {
       await runner.dispose();
     }
+    const remaining = await runProcess(
+      [
+        dockerExecutable,
+        'container',
+        'ls',
+        '--all',
+        '--quiet',
+        '--filter',
+        `label=${DOCKER_RUN_LABEL}=${runId}`,
+      ],
+      {
+        environment: safeHostEnvironment(
+          process.env.HOME ? { HOME: process.env.HOME } : {},
+        ),
+        timeoutMs: 30_000,
+      },
+    );
+    expect(remaining.exitCode, remaining.output).toBe(0);
+    expect(remaining.stdout.trim()).toBe('');
   });
 });
 
@@ -209,7 +247,6 @@ describe('candidate install failure classification', () => {
         2,
       )}\n`,
     );
-    const { runProcess, safeHostEnvironment } = await import('../../src/process.js');
     const environment = safeHostEnvironment({
       GIT_AUTHOR_NAME: 'Downstream Canary Fixture',
       GIT_AUTHOR_EMAIL: 'fixture@example.invalid',

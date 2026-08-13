@@ -3,7 +3,8 @@ import process from 'node:process';
 import { randomUUID } from 'node:crypto';
 import { runCanary } from './engine.js';
 import { errorDiagnostic } from './errors.js';
-import { configFromInvocation, currentWorkspace, type InvocationValues } from './invocation.js';
+import { enforceTrustedActionEnvironment } from './action-environment.js';
+import { configFromActionInvocation, type InvocationValues } from './invocation.js';
 import { terminalTable } from './report.js';
 import { diagnosticExcerpt } from './util/logs.js';
 
@@ -13,12 +14,18 @@ function input(name: string): string | undefined {
 }
 
 function actionValues(): InvocationValues {
+  if (input('CONFIG') !== undefined) {
+    throw new Error(
+      'The v0.1 GitHub Action rejects the removed config input; declare policy in the Action invocation.',
+    );
+  }
   return {
     consumers: input('CONSUMERS'),
-    config: input('CONFIG'),
+    config: undefined,
     candidateRoot: input('CANDIDATE-ROOT'),
     outputDirectory: input('OUTPUT-DIRECTORY'),
     timeoutSeconds: input('TIMEOUT-SECONDS'),
+    runTimeoutSeconds: input('RUN-TIMEOUT-SECONDS'),
     candidatePackageManager: input('CANDIDATE-PACKAGE-MANAGER'),
     candidatePackageManagerVersion: input('CANDIDATE-PACKAGE-MANAGER-VERSION'),
     candidateBuildCommand: input('CANDIDATE-BUILD-COMMAND'),
@@ -44,7 +51,11 @@ function escapeWorkflowCommand(value: string): string {
 }
 
 async function main(): Promise<number> {
-  const config = await configFromInvocation(currentWorkspace(), actionValues());
+  const trustedEnvironment = enforceTrustedActionEnvironment();
+  const config = await configFromActionInvocation(
+    trustedEnvironment.workspace,
+    actionValues(),
+  );
   const run = await runCanary(config);
   process.stdout.write(`${terminalTable(run.report)}\n`);
   await setOutput('report-path', run.paths.json);

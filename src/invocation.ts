@@ -1,4 +1,3 @@
-import process from 'node:process';
 import { resolveRunConfig, parseJsonCommandInput } from './config.js';
 import { CanaryError } from './errors.js';
 import type {
@@ -13,6 +12,7 @@ export interface InvocationValues {
   readonly candidateRoot: string | undefined;
   readonly outputDirectory: string | undefined;
   readonly timeoutSeconds: string | undefined;
+  readonly runTimeoutSeconds: string | undefined;
   readonly candidatePackageManager: string | undefined;
   readonly candidatePackageManagerVersion: string | undefined;
   readonly candidateBuildCommand: string | undefined;
@@ -69,11 +69,13 @@ function consumerOverrides(values: InvocationValues): ProjectOverrides {
   });
 }
 
-export async function configFromInvocation(
+async function configFromInvocation(
   cwd: string,
   values: InvocationValues,
+  configurationSource: 'cli' | 'none',
 ) {
   let timeoutSeconds: number | undefined;
+  let runTimeoutSeconds: number | undefined;
   if (values.timeoutSeconds !== undefined) {
     timeoutSeconds = Number(values.timeoutSeconds);
     if (!Number.isInteger(timeoutSeconds)) {
@@ -84,18 +86,50 @@ export async function configFromInvocation(
       );
     }
   }
+  if (values.runTimeoutSeconds !== undefined) {
+    runTimeoutSeconds = Number(values.runTimeoutSeconds);
+    if (!Number.isInteger(runTimeoutSeconds)) {
+      throw new CanaryError(
+        'configuration',
+        'configuration',
+        'run-timeout-seconds must be an integer.',
+      );
+    }
+  }
   return await resolveRunConfig({
     cwd,
-    ...(values.config ? { configPath: values.config } : {}),
+    configurationSource,
+    executionMode: configurationSource === 'none' ? 'github-action' : 'local-cli',
+    ...(configurationSource === 'cli' && values.config
+      ? { configPath: values.config }
+      : {}),
     ...(values.consumers ? { consumersText: values.consumers } : {}),
     ...(values.candidateRoot ? { candidateRoot: values.candidateRoot } : {}),
     ...(values.outputDirectory ? { outputDirectory: values.outputDirectory } : {}),
     ...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),
+    ...(runTimeoutSeconds !== undefined ? { runTimeoutSeconds } : {}),
     candidateOverrides: candidateOverrides(values),
     consumerOverrides: consumerOverrides(values),
   });
 }
 
-export function currentWorkspace(): string {
-  return process.env.GITHUB_WORKSPACE ?? process.cwd();
+export async function configFromCliInvocation(
+  cwd: string,
+  values: InvocationValues,
+) {
+  return await configFromInvocation(cwd, values, 'cli');
+}
+
+export async function configFromActionInvocation(
+  cwd: string,
+  values: InvocationValues,
+) {
+  if (values.config !== undefined) {
+    throw new CanaryError(
+      'configuration',
+      'configuration',
+      'The v0.1 GitHub Action does not accept configuration files; declare policy in the Action invocation.',
+    );
+  }
+  return await configFromInvocation(cwd, values, 'none');
 }

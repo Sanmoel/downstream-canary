@@ -4,6 +4,7 @@ import { CanaryError } from './errors.js';
 import { runProcess, safeHostEnvironment } from './process.js';
 import { FIXTURE_LOCAL_PATH, type CommandArray, type ConsumerSpec } from './types.js';
 import { validateFullCommitSha, validatePublicGitHubUrl } from './validation.js';
+import type { RunBudget } from './budget.js';
 
 function gitEnvironment(configDirectory: string): Record<string, string> {
   return safeHostEnvironment({
@@ -43,14 +44,18 @@ export async function checkoutConsumer(
   consumer: ConsumerSpec,
   destination: string,
   configDirectory: string,
-  timeoutSeconds: number,
+  budget: RunBudget,
 ): Promise<void> {
   validatePublicGitHubUrl(consumer.repositoryUrl);
   validateFullCommitSha(consumer.commit);
   await mkdir(destination, { recursive: true });
   await mkdir(configDirectory, { recursive: true });
-  const timeoutMs = timeoutSeconds * 1000;
-  await git(['init', '--quiet', '--initial-branch=canary'], destination, configDirectory, timeoutMs);
+  await git(
+    ['init', '--quiet', '--initial-branch=canary'],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds('Git checkout initialization'),
+  );
   await git(
     [
       'remote',
@@ -60,16 +65,26 @@ export async function checkoutConsumer(
     ],
     destination,
     configDirectory,
-    timeoutMs,
+    budget.timeoutMilliseconds('Git remote configuration'),
   );
   await git(
     ['fetch', '--quiet', '--depth=1', '--no-tags', 'origin', consumer.commit],
     destination,
     configDirectory,
-    timeoutMs,
+    budget.timeoutMilliseconds('Git pinned-commit fetch'),
   );
-  await git(['checkout', '--quiet', '--detach', 'FETCH_HEAD'], destination, configDirectory, timeoutMs);
-  const actual = await git(['rev-parse', 'HEAD'], destination, configDirectory, timeoutMs);
+  await git(
+    ['checkout', '--quiet', '--detach', 'FETCH_HEAD'],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds('Git detached checkout'),
+  );
+  const actual = await git(
+    ['rev-parse', 'HEAD'],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds('Git commit verification'),
+  );
   if (actual !== consumer.commit) {
     throw new CanaryError(
       'infrastructure',
@@ -81,7 +96,7 @@ export async function checkoutConsumer(
     ['ls-files', '--stage'],
     destination,
     configDirectory,
-    timeoutMs,
+    budget.timeoutMilliseconds('Git submodule inspection'),
   );
   if (stagedFiles.split('\n').some((line) => line.startsWith('160000 '))) {
     throw new CanaryError(

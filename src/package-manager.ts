@@ -211,7 +211,14 @@ function validateYarnRegistryConfiguration(value: unknown, path = '.yarnrc.yml')
 function parsePackageManagerDeclaration(
   declaration: string,
 ): { readonly name: PackageManagerName; readonly version: string } {
-  const match = /^(npm|pnpm|yarn)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+sha(?:224|256|384|512)\.[A-Za-z0-9+/=]+)?$/.exec(
+  if (/^(?:npm|pnpm|yarn)@[^\s]+\+sha(?:224|256|384|512)\./.test(declaration)) {
+    throw new CanaryError(
+      'unsupported-project',
+      'configuration',
+      'packageManager integrity suffixes are rejected in v0.1 because their bytes are not yet independently verified.',
+    );
+  }
+  const match = /^(npm|pnpm|yarn)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(
     declaration,
   );
   if (!match?.[1] || !match[2]) {
@@ -274,78 +281,17 @@ function managerCommands(
   }
 }
 
-function hasArgument(
-  command: CommandArray,
-  expected: string,
-  expectedValue?: string,
-): boolean {
-  const arguments_ = command.slice(2);
-  if (expectedValue === undefined) return arguments_.includes(expected);
-  return (
-    arguments_.includes(`${expected}=${expectedValue}`) ||
-    arguments_.some(
-      (argument, index) =>
-        argument === expected && arguments_[index + 1] === expectedValue,
-    )
-  );
-}
-
-function validateManagerCommandOverride(
-  command: CommandArray,
-  name: PackageManagerName,
-  version: string,
-  kind: 'install' | 'lockfile',
-): void {
-  if (command[0] !== 'corepack' || command[1] !== `${name}@${version}`) {
-    throw new CanaryError(
-      'configuration',
-      'configuration',
-      `Explicit ${kind}Command must invoke corepack ${name}@${version} so the executed package-manager version remains exact.`,
-    );
-  }
-  const forbiddenArguments = new Set([
-    '--force',
-    '--legacy-peer-deps',
-    '--no-package-lock',
-    '--package-lock=false',
-    '--frozen-lockfile=false',
-    '--no-frozen-lockfile',
-    '--immutable=false',
-    '--no-immutable',
-  ]);
-  if (command.some((argument) => forbiddenArguments.has(argument))) {
-    throw new CanaryError(
-      'configuration',
-      'configuration',
-      `Explicit ${kind}Command contains a validation-bypassing package-manager flag.`,
-    );
-  }
-  const valid =
-    kind === 'install'
-      ? name === 'npm'
-        ? hasArgument(command, 'ci')
-        : name === 'pnpm'
-          ? hasArgument(command, 'install') && hasArgument(command, '--frozen-lockfile')
-          : hasArgument(command, 'install') && hasArgument(command, '--immutable')
-      : name === 'npm'
-        ? hasArgument(command, 'install') && hasArgument(command, '--package-lock-only')
-        : name === 'pnpm'
-          ? hasArgument(command, 'install') && hasArgument(command, '--lockfile-only')
-          : hasArgument(command, 'install') &&
-            hasArgument(command, '--mode', 'update-lockfile');
-  if (!valid) {
-    throw new CanaryError(
-      'configuration',
-      'configuration',
-      `Explicit ${kind}Command does not preserve the required ${name} ${kind === 'install' ? 'frozen installation' : 'lockfile-only generation'} contract.`,
-    );
-  }
-}
-
 async function validateProjectConfiguration(
   projectDirectory: string,
   manager: PackageManagerName,
 ): Promise<void> {
+  if (await metadataIfPresent(join(projectDirectory, '.corepack.env'))) {
+    throw new CanaryError(
+      'unsupported-project',
+      'configuration',
+      'Project .corepack.env files are unsupported; Downstream Canary sets COREPACK_ENV_FILE=0 and fails closed.',
+    );
+  }
   const npmrcPath = join(projectDirectory, '.npmrc');
   if (await regularFileExists(npmrcPath, 'Project .npmrc')) {
     const npmrc = await readFile(npmrcPath, 'utf8');
@@ -522,22 +468,6 @@ export async function detectPackageManager(
     `${name} version`,
   );
   const defaults = managerCommands(name, requestedVersion);
-  if (overrides.installCommand) {
-    validateManagerCommandOverride(
-      overrides.installCommand,
-      name,
-      requestedVersion,
-      'install',
-    );
-  }
-  if (overrides.lockfileCommand) {
-    validateManagerCommandOverride(
-      overrides.lockfileCommand,
-      name,
-      requestedVersion,
-      'lockfile',
-    );
-  }
   if (requireTest && !overrides.testCommand && typeof manifest.scripts?.test !== 'string') {
     throw new CanaryError(
       'unsupported-project',
@@ -554,8 +484,8 @@ export async function detectPackageManager(
     actualVersion: null,
     lockfile: lock.file,
     workingDirectory,
-    immutableInstallCommand: overrides.installCommand ?? defaults.install,
-    lockfileCommand: overrides.lockfileCommand ?? defaults.lockfile,
+    immutableInstallCommand: defaults.install,
+    lockfileCommand: defaults.lockfile,
     testCommand: overrides.testCommand ?? defaults.test,
   };
 }

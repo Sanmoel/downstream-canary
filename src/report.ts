@@ -13,6 +13,11 @@ import type {
   ConsumerResult,
 } from './types.js';
 import { stableStringify } from './util/stable-json.js';
+import {
+  policySha256,
+  resolvePolicy,
+  type ResolvedPolicyContext,
+} from './policy.js';
 
 export interface ReportPaths {
   readonly json: string;
@@ -24,13 +29,19 @@ export function createReport(
   dockerImage: string,
   results: readonly ConsumerResult[],
   generatedAt = new Date().toISOString(),
+  policyContext?: ResolvedPolicyContext,
 ): CanaryReport {
   const count = (classification: ConsumerResult['classification']): number =>
     results.filter((result) => result.classification === classification).length;
+  const resolvedPolicy = resolvePolicy(results, policyContext);
   return {
     schemaVersion: REPORT_SCHEMA_VERSION,
     tool: { name: PACKAGE_NAME, version: VERSION },
     generatedAt,
+    policy: {
+      sha256: policySha256(resolvedPolicy),
+      resolved: resolvedPolicy,
+    },
     candidate: {
       packageName: artifact.packageName,
       packageVersion: artifact.packageVersion,
@@ -97,6 +108,8 @@ export function markdownReport(report: CanaryReport): string {
     `Candidate: \`${report.candidate.packageName}@${report.candidate.packageVersion}\``,
     '',
     `Tarball SHA-256: \`${report.candidate.tarballSha256}\``,
+    '',
+    `Resolved policy SHA-256: \`${report.policy.sha256}\``,
     '',
     '| Consumer | Commit | Manager | Baseline | Candidate | Classification | Failure phase |',
     '| --- | --- | --- | --- | --- | --- | --- |',

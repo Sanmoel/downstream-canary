@@ -3,7 +3,7 @@ import process from 'node:process';
 import { VERSION } from './constants.js';
 import { runCanary } from './engine.js';
 import { errorDiagnostic } from './errors.js';
-import { configFromInvocation, type InvocationValues } from './invocation.js';
+import { configFromCliInvocation, type InvocationValues } from './invocation.js';
 import { parseArguments, rejectUnknownOptions } from './options.js';
 import { terminalTable } from './report.js';
 import { diagnosticExcerpt } from './util/logs.js';
@@ -11,15 +11,17 @@ import { diagnosticExcerpt } from './util/logs.js';
 const HELP = `Downstream Canary ${VERSION}
 
 Usage:
-  downstream-canary --consumers "OWNER/REPO@FULL_SHA" [options]
-  downstream-canary --config .downstream-canary.yml [options]
+  downstream-canary --local --candidate-root . --consumers "OWNER/REPO@FULL_SHA" [options]
+  downstream-canary --local --candidate-root . --config .downstream-canary.yml [options]
 
 Options:
+  --local                                Explicitly select the local CLI boundary
   --consumers <lines>                    Pinned public GitHub consumers
   --config <path>                        Optional YAML configuration
   --candidate-root <path>                Candidate repository root (default: .)
   --output-directory <path>              Report directory
   --timeout-seconds <integer>            Per-command timeout
+  --run-timeout-seconds <integer>        Monotonic whole-run timeout
   --candidate-package-manager <name>     npm, pnpm, or yarn override
   --candidate-package-manager-version <v> Exact candidate manager version
   --candidate-build-command <json-array> Candidate build command
@@ -36,6 +38,7 @@ const ALLOWED = new Set([
   'candidate-root',
   'output-directory',
   'timeout-seconds',
+  'run-timeout-seconds',
   'candidate-package-manager',
   'candidate-package-manager-version',
   'candidate-build-command',
@@ -51,6 +54,7 @@ function invocationValues(values: ReadonlyMap<string, string>): InvocationValues
     candidateRoot: values.get('candidate-root'),
     outputDirectory: values.get('output-directory'),
     timeoutSeconds: values.get('timeout-seconds'),
+    runTimeoutSeconds: values.get('run-timeout-seconds'),
     candidatePackageManager: values.get('candidate-package-manager'),
     candidatePackageManagerVersion: values.get('candidate-package-manager-version'),
     candidateBuildCommand: values.get('candidate-build-command'),
@@ -70,8 +74,19 @@ async function main(): Promise<number> {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
+  if (!parsed.flags.has('local')) {
+    throw new Error(
+      'Local CLI execution requires --local and an explicit --candidate-root path.',
+    );
+  }
+  if (!parsed.values.has('candidate-root')) {
+    throw new Error('Local CLI execution requires --candidate-root <path>.');
+  }
   rejectUnknownOptions(parsed, ALLOWED);
-  const config = await configFromInvocation(process.cwd(), invocationValues(parsed.values));
+  const config = await configFromCliInvocation(
+    process.cwd(),
+    invocationValues(parsed.values),
+  );
   const run = await runCanary(config);
   process.stdout.write(`${terminalTable(run.report)}\n\n`);
   process.stdout.write(`JSON report: ${run.paths.json}\n`);

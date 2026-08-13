@@ -4,9 +4,12 @@ import { parse as parseYaml } from 'yaml';
 import {
   CONFIG_SCHEMA_VERSION,
   DEFAULT_TIMEOUT_SECONDS,
+  DEFAULT_RUN_TIMEOUT_SECONDS,
   MAX_CONSUMERS,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
+  MAX_RUN_TIMEOUT_SECONDS,
+  MIN_RUN_TIMEOUT_SECONDS,
   RUNNER_IMAGE,
 } from './constants.js';
 import { CanaryError } from './errors.js';
@@ -34,19 +37,24 @@ interface RawConfig {
   readonly defaults: ProjectOverrides;
   readonly outputDirectory?: string;
   readonly timeoutSeconds?: number;
+  readonly runTimeoutSeconds?: number;
 }
 
 export interface ResolveConfigOptions {
   readonly cwd: string;
+  /** Candidate-controlled configuration must never be enabled by Action mode. */
+  readonly configurationSource?: 'cli' | 'none';
   readonly configPath?: string;
   readonly candidateRoot?: string;
   readonly outputDirectory?: string;
   readonly timeoutSeconds?: number;
+  readonly runTimeoutSeconds?: number;
   readonly consumersText?: string;
   readonly candidateOverrides?: ProjectOverrides;
   readonly consumerOverrides?: ProjectOverrides;
   readonly dockerExecutable?: string;
   readonly dockerImage?: string;
+  readonly executionMode?: RunConfig['executionMode'];
 }
 
 async function regularFileExists(path: string, label: string): Promise<boolean> {
@@ -156,8 +164,6 @@ function parseConsumerObject(
     'packageManager',
     'packageManagerVersion',
     'lockfile',
-    'installCommand',
-    'lockfileCommand',
     'testCommand',
   ]);
   rejectUnknownKeys(value, allowed, `consumers[${index}]`);
@@ -216,7 +222,7 @@ function parseRawConfig(value: unknown, candidateRoot: string): RawConfig {
   }
   rejectUnknownKeys(
     value,
-    new Set(['version', 'candidate', 'defaults', 'consumers', 'outputDirectory', 'timeoutSeconds']),
+    new Set(['version', 'candidate', 'defaults', 'consumers', 'outputDirectory', 'timeoutSeconds', 'runTimeoutSeconds']),
     'configuration',
   );
   if (value.version !== CONFIG_SCHEMA_VERSION) {
@@ -247,7 +253,6 @@ function parseRawConfig(value: unknown, candidateRoot: string): RawConfig {
       'packageManager',
       'packageManagerVersion',
       'lockfile',
-      'installCommand',
       'buildCommand',
     ]),
     'candidate',
@@ -261,6 +266,18 @@ function parseRawConfig(value: unknown, candidateRoot: string): RawConfig {
       'configuration',
       'configuration',
       'candidate.workingDirectory must be a string.',
+    );
+  }
+  if (
+    value.runTimeoutSeconds !== undefined &&
+    (!Number.isInteger(value.runTimeoutSeconds) ||
+      (value.runTimeoutSeconds as number) < MIN_RUN_TIMEOUT_SECONDS ||
+      (value.runTimeoutSeconds as number) > MAX_RUN_TIMEOUT_SECONDS)
+  ) {
+    throw new CanaryError(
+      'configuration',
+      'configuration',
+      `runTimeoutSeconds must be an integer from ${MIN_RUN_TIMEOUT_SECONDS} to ${MAX_RUN_TIMEOUT_SECONDS}.`,
     );
   }
   const normalizedCandidateWorkingDirectory =
@@ -321,6 +338,9 @@ function parseRawConfig(value: unknown, candidateRoot: string): RawConfig {
     ...(typeof value.timeoutSeconds === 'number'
       ? { timeoutSeconds: value.timeoutSeconds }
       : {}),
+    ...(typeof value.runTimeoutSeconds === 'number'
+      ? { runTimeoutSeconds: value.runTimeoutSeconds }
+      : {}),
   };
 }
 
@@ -358,33 +378,44 @@ export async function resolveRunConfig(
     'Candidate root',
   );
   const candidateRoot = resolve(options.cwd, candidateRootRelative);
-  const configPathRelative = validateRelativeWorkingDirectory(
-    options.configPath ?? '.downstream-canary.yml',
-  );
-  await assertSafeDirectoryPath(
-    options.cwd,
-    dirname(configPathRelative),
-    'Configuration parent directory',
-  );
-  const configPath = resolve(options.cwd, configPathRelative);
-  const hasConfig = await regularFileExists(configPath, 'Configuration file');
-  if (options.configPath && !hasConfig) {
+  const configurationSource = options.configurationSource ?? 'cli';
+  if (configurationSource === 'none' && options.configPath !== undefined) {
     throw new CanaryError(
       'configuration',
       'configuration',
-      `Configuration file does not exist: ${configPath}`,
+      'Configuration files are not accepted by the GitHub Action trust boundary.',
     );
   }
-  const raw = hasConfig
-    ? parseRawConfig(
+  let raw: RawConfig = {
+    candidate: { root: candidateRoot, workingDirectory: '.' },
+    consumers: [],
+    defaults: {},
+  };
+  if (configurationSource === 'cli') {
+    const configPathRelative = validateRelativeWorkingDirectory(
+      options.configPath ?? '.downstream-canary.yml',
+    );
+    await assertSafeDirectoryPath(
+      options.cwd,
+      dirname(configPathRelative),
+      'Configuration parent directory',
+    );
+    const configPath = resolve(options.cwd, configPathRelative);
+    const hasConfig = await regularFileExists(configPath, 'Configuration file');
+    if (options.configPath && !hasConfig) {
+      throw new CanaryError(
+        'configuration',
+        'configuration',
+        `Configuration file does not exist: ${configPath}`,
+      );
+    }
+    if (hasConfig) {
+      raw = parseRawConfig(
         parseYaml(await readFile(configPath, 'utf8'), { maxAliasCount: 0 }),
         candidateRoot,
-      )
-    : {
-        candidate: { root: candidateRoot, workingDirectory: '.' },
-        consumers: [],
-        defaults: {},
-      };
+      );
+    }
+  }
 
   const inputConsumers = options.consumersText
     ? parseConsumersInput(options.consumersText).map((consumer) =>
@@ -406,6 +437,22 @@ export async function resolveRunConfig(
       'configuration',
       'configuration',
       `Timeout must be an integer from ${MIN_TIMEOUT_SECONDS} to ${MAX_TIMEOUT_SECONDS} seconds.`,
+    );
+  }
+
+  const runTimeoutSeconds =
+    options.runTimeoutSeconds ??
+    raw.runTimeoutSeconds ??
+    DEFAULT_RUN_TIMEOUT_SECONDS;
+  if (
+    !Number.isInteger(runTimeoutSeconds) ||
+    runTimeoutSeconds < MIN_RUN_TIMEOUT_SECONDS ||
+    runTimeoutSeconds > MAX_RUN_TIMEOUT_SECONDS
+  ) {
+    throw new CanaryError(
+      'configuration',
+      'configuration',
+      `Whole-run timeout must be an integer from ${MIN_RUN_TIMEOUT_SECONDS} to ${MAX_RUN_TIMEOUT_SECONDS} seconds.`,
     );
   }
 
@@ -433,8 +480,10 @@ export async function resolveRunConfig(
     consumers: inputConsumers,
     outputDirectory: resolve(options.cwd, outputDirectoryRelative),
     timeoutSeconds,
+    runTimeoutSeconds,
     dockerExecutable: options.dockerExecutable ?? 'docker',
     dockerImage: options.dockerImage ?? RUNNER_IMAGE,
+    executionMode: options.executionMode ?? 'library',
   };
 }
 

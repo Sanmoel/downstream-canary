@@ -9,6 +9,7 @@ import {
   type CandidateConfig,
   type CommandArray,
   type ConsumerSpec,
+  type ManagerProvision,
   type PackageManagerName,
 } from '../src/types.js';
 import {
@@ -23,6 +24,7 @@ export type FixtureExpectation =
   | 'preexisting'
   | 'improvement'
   | 'security'
+  | 'coverage'
   | 'injection-failure';
 
 export interface FixtureRepository {
@@ -83,40 +85,60 @@ function candidateManifest(): Record<string, unknown> {
     version: '1.0.0',
     private: true,
     main: 'index.cjs',
+    files: ['index.cjs'],
     packageManager: `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-    scripts: { test: 'node test.cjs' },
+    devDependencies: {
+      'environment-probe': 'file:vendor/environment-probe.tgz',
+    },
+    scripts: {
+      build: 'node environment-check.cjs',
+      test: 'node test.cjs',
+    },
   };
 }
 
-function npmLock(manifest: Record<string, unknown>): string {
-  return `${JSON.stringify(
-    {
-      name: manifest.name,
-      version: manifest.version,
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        '': {
-          name: manifest.name,
-          version: manifest.version,
-        },
+function environmentCheckSource(label: string): string {
+  return `const assert=require('node:assert/strict');for(const [name,value] of Object.entries(process.env)){assert.doesNotMatch(name,/TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH/i);assert.notEqual(value,'downstream-canary-secret-sentinel')}console.log(${JSON.stringify(`${label}: secret isolation pass`)});\n`;
+}
+
+function environmentProbeTarball(): Buffer {
+  const manifest = Buffer.from(
+    `${JSON.stringify(
+      {
+        name: 'environment-probe',
+        version: '1.0.0',
+        scripts: { preinstall: 'node check.cjs' },
       },
-    },
-    null,
-    2,
-  )}\n`;
+      null,
+      2,
+    )}\n`,
+  );
+  const implementation = Buffer.from(
+    environmentCheckSource('candidate dependency install'),
+  );
+  const tar = Buffer.concat([
+    tarHeader('package/package.json', manifest),
+    tarHeader('package/check.cjs', implementation),
+    Buffer.alloc(1024),
+  ]);
+  return gzipSync(tar);
 }
 
 async function createCandidate(
   root: string,
+  docker: DockerRunner,
+  managerProvision: ManagerProvision,
   name: string,
   compatible: boolean,
 ): Promise<CandidateConfig> {
   const directory = join(root, name);
-  await mkdir(directory, { recursive: true });
+  await mkdir(join(directory, 'vendor'), { recursive: true });
+  await writeFile(
+    join(directory, 'vendor', 'environment-probe.tgz'),
+    environmentProbeTarball(),
+  );
   const manifest = candidateManifest();
   await writeFile(join(directory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-  await writeFile(join(directory, 'package-lock.json'), npmLock(manifest));
   await writeFile(
     join(directory, 'index.cjs'),
     compatible
@@ -129,6 +151,23 @@ async function createCandidate(
       ? "const assert=require('node:assert/strict');assert.deepEqual(require('./').parse('ok'),{value:'ok'});console.log('candidate library tests: pass');\n"
       : "const assert=require('node:assert/strict');assert.deepEqual(require('./').parse('ok'),{text:'ok'});console.log('candidate library tests: pass');\n",
   );
+  await writeFile(
+    join(directory, 'environment-check.cjs'),
+    environmentCheckSource('candidate install/build'),
+  );
+  const lockfile = await docker.run({
+    workspace: directory,
+    cacheDirectory: join(root, `${name}-lock-cache`),
+    command: lockfileGenerationCommand('npm'),
+    timeoutSeconds: 180,
+    network: 'bridge',
+    phase: `${name}-fixture-lock`,
+    managerProvision,
+    extraEnvironment: managerLockfileEnvironment({ name: 'npm' }),
+  });
+  if (lockfile.exitCode !== 0) {
+    throw new Error(`Unable to create ${name} lockfile: ${lockfile.output}`);
+  }
   return { root: directory, workingDirectory: '.' };
 }
 
@@ -137,6 +176,8 @@ function testSource(expectation: FixtureExpectation): string {
     case 'compatible':
     case 'regression':
       return "const assert=require('node:assert/strict');assert.deepEqual(require('tiny-parser').parse('hello'),{value:'hello'});console.log('downstream test: pass');\n";
+    case 'coverage':
+      return "const assert=require('node:assert/strict');const fs=require('node:fs');fs.mkdirSync('coverage',{recursive:true});fs.writeFileSync('coverage/summary.json','{\\\"covered\\\":true}\\n');assert.deepEqual(require('tiny-parser').parse('hello'),{value:'hello'});console.log('coverage-producing downstream test: pass');\n";
     case 'preexisting':
       return "const assert=require('node:assert/strict');assert.deepEqual(require('tiny-parser').parse('hello'),{missing:'hello'});\n";
     case 'improvement':
@@ -223,6 +264,7 @@ async function createConsumer(
   id: string,
   manager: PackageManagerName,
   expectation: FixtureExpectation,
+  managerProvision: ManagerProvision,
 ): Promise<FixtureRepository> {
   const directory = join(root, id);
   await mkdir(join(directory, 'vendor'), { recursive: true });
@@ -234,6 +276,14 @@ async function createConsumer(
     packageManager: `${manager}@${DEFAULT_PACKAGE_MANAGER_VERSIONS[manager]}`,
     scripts: { test: 'node test.cjs' },
   };
+  if (expectation === 'security') {
+    (manifest.scripts as Record<string, string>).preinstall =
+      'node environment-check.cjs';
+    await writeFile(
+      join(directory, 'environment-check.cjs'),
+      environmentCheckSource('consumer install'),
+    );
+  }
   if (expectation !== 'injection-failure') {
     manifest.dependencies = { 'tiny-parser': 'file:vendor/tiny-parser-1.0.0.tgz' };
   }
@@ -250,6 +300,7 @@ async function createConsumer(
     timeoutSeconds: 180,
     network: 'bridge',
     phase: `${id}-fixture-lock`,
+    managerProvision,
     extraEnvironment: managerLockfileEnvironment({ name: manager }),
   });
   if (result.exitCode !== 0) {
@@ -275,10 +326,35 @@ export async function createFixtureWorld(
   const docker = new DockerRunner(dockerExecutable, RUNNER_IMAGE);
   try {
     await docker.ensureReady();
-    const candidateBreaking = await createCandidate(root, 'candidate-breaking', false);
-    const candidateCompatible = await createCandidate(root, 'candidate-compatible', true);
+    const managerProvisions = {} as Record<PackageManagerName, ManagerProvision>;
+    for (const manager of ['npm', 'pnpm', 'yarn'] as const) {
+      managerProvisions[manager] = await docker.provisionManager(
+        root,
+        join(root, `.fixture-${manager}-manager`),
+        {
+          name: manager,
+          requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS[manager],
+        },
+        180,
+      );
+    }
+    const candidateBreaking = await createCandidate(
+      root,
+      docker,
+      managerProvisions.npm,
+      'candidate-breaking',
+      false,
+    );
+    const candidateCompatible = await createCandidate(
+      root,
+      docker,
+      managerProvisions.npm,
+      'candidate-compatible',
+      true,
+    );
     const definitions: readonly [string, PackageManagerName, FixtureExpectation][] = [
       ['npm-compatible', 'npm', 'compatible'],
+      ['npm-coverage', 'npm', 'coverage'],
       ['npm-regression', 'npm', 'regression'],
       ['pnpm-compatible', 'pnpm', 'compatible'],
       ['pnpm-regression', 'pnpm', 'regression'],
@@ -291,7 +367,14 @@ export async function createFixtureWorld(
     ];
     const consumers: Record<string, FixtureRepository> = {};
     for (const [id, manager, expectation] of definitions) {
-      consumers[id] = await createConsumer(root, docker, id, manager, expectation);
+      consumers[id] = await createConsumer(
+        root,
+        docker,
+        id,
+        manager,
+        expectation,
+        managerProvisions[manager],
+      );
     }
     return { root, candidateBreaking, candidateCompatible, consumers };
   } catch (error) {

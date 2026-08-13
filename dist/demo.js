@@ -1,17 +1,17 @@
 // src/demo.ts
-import process4 from "node:process";
+import process5 from "node:process";
 import { join as join12 } from "node:path";
 
 // fixtures/factory.ts
 import { gzipSync } from "node:zlib";
 import { mkdir as mkdir2, mkdtemp as mkdtemp2, writeFile } from "node:fs/promises";
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 import { tmpdir as tmpdir2 } from "node:os";
 
 // src/docker.ts
 import process3 from "node:process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join as join3 } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
@@ -27,14 +27,19 @@ var DEFAULT_PACKAGE_MANAGER_VERSIONS = {
   yarn: "4.18.0"
 };
 var DEFAULT_TIMEOUT_SECONDS = 10 * 60;
+var DEFAULT_RUN_TIMEOUT_SECONDS = 45 * 60;
 var MIN_TIMEOUT_SECONDS = 1;
 var MAX_TIMEOUT_SECONDS = 60 * 60;
+var MIN_RUN_TIMEOUT_SECONDS = 1;
+var MAX_RUN_TIMEOUT_SECONDS = 6 * 60 * 60;
 var MAX_CONSUMERS = 10;
 var MAX_PROCESS_OUTPUT_BYTES = 64 * 1024;
 var MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 var MAX_TARBALL_BYTES = 50 * 1024 * 1024;
 var MAX_UNPACKED_TARBALL_BYTES = 200 * 1024 * 1024;
 var MAX_TARBALL_ENTRIES = 2e4;
+var MAX_GENERATED_FILES_PER_LANE = 2e3;
+var MAX_GENERATED_BYTES_PER_LANE = 100 * 1024 * 1024;
 var DOCKER_LIMITS = {
   cpus: "2",
   memory: "1g",
@@ -242,227 +247,189 @@ ${spawnError.message}`;
   });
 }
 
-// src/docker.ts
-var DockerRunner = class {
-  #executable;
-  #image;
-  #configDirectory;
-  #dockerHost = process3.env.DOCKER_HOST;
-  constructor(executable, image) {
-    this.#executable = executable;
-    this.#image = image;
-  }
-  async #environment() {
-    this.#configDirectory ??= await mkdtemp(join(tmpdir(), "downstream-canary-docker-"));
-    return safeHostEnvironment({
-      DOCKER_CONFIG: this.#configDirectory,
-      ...this.#dockerHost ? { DOCKER_HOST: this.#dockerHost } : {}
-    });
-  }
-  async ensureReady() {
-    let environment = await this.#environment();
-    let version = await runProcess(
-      [this.#executable, "version", "--format", "{{.Server.Version}}"],
-      { environment, timeoutMs: 3e4 }
+// src/action-environment.ts
+import { isAbsolute as isAbsolute2 } from "node:path";
+function validateLocalDockerHost(value) {
+  if (value === void 0 || value.trim() === "") return void 0;
+  const normalized = value.trim();
+  let url;
+  try {
+    url = new URL(normalized);
+  } catch (error) {
+    throw new CanaryError(
+      "configuration",
+      "docker",
+      "DOCKER_HOST must be unset or select a local absolute Unix-domain socket.",
+      { cause: error }
     );
-    if (version.exitCode !== 0 && !this.#dockerHost && process3.env.HOME) {
-      const context = await runProcess(
-        [
-          this.#executable,
-          "context",
-          "inspect",
-          "--format",
-          '{{(index .Endpoints "docker").Host}}'
-        ],
-        {
-          environment: safeHostEnvironment({ HOME: process3.env.HOME }),
-          timeoutMs: 3e4
-        }
-      );
-      const discoveredHost = context.stdout.trim();
-      if (context.exitCode === 0 && /^unix:\/\/.+/.test(discoveredHost)) {
-        this.#dockerHost = discoveredHost;
-        environment = await this.#environment();
-        version = await runProcess(
-          [this.#executable, "version", "--format", "{{.Server.Version}}"],
-          { environment, timeoutMs: 3e4 }
-        );
-      }
-    }
-    if (version.exitCode !== 0) {
-      throw new CanaryError(
-        "infrastructure",
-        "docker",
-        "Docker Engine is required and was not reachable.",
-        { diagnostic: version.output }
-      );
-    }
-    const inspect = await runProcess(
-      [this.#executable, "image", "inspect", this.#image],
-      { environment, timeoutMs: 3e4 }
+  }
+  if (url.protocol !== "unix:" || url.hostname !== "" || !isAbsolute2(decodeURIComponent(url.pathname)) || url.search !== "" || url.hash !== "" || url.username !== "" || url.password !== "") {
+    throw new CanaryError(
+      "configuration",
+      "docker",
+      "Remote Docker endpoints are forbidden; DOCKER_HOST must be unset or use a local unix:///absolute/path socket."
     );
-    if (inspect.exitCode !== 0) {
-      const pull = await runProcess([this.#executable, "pull", this.#image], {
-        environment,
-        timeoutMs: 10 * 6e4
-      });
-      if (pull.exitCode !== 0) {
-        throw new CanaryError(
-          "infrastructure",
-          "docker",
-          `Unable to pull the pinned runner image ${this.#image}.`,
-          { diagnostic: pull.output }
-        );
-      }
-    }
   }
-  async run(options) {
-    const cacheDirectory = options.cacheDirectory ?? join(options.workspace, ".downstream-canary", "runtime-cache");
-    const packageCacheDirectory = join(cacheDirectory, "package-cache");
-    const corepackDirectory = join(cacheDirectory, "corepack");
-    await mkdir(packageCacheDirectory, { recursive: true });
-    await mkdir(corepackDirectory, { recursive: true });
-    const name = `downstream-canary-${options.phase.replace(/[^a-z0-9_.-]/gi, "-")}-${randomUUID()}`;
-    const uid = typeof process3.getuid === "function" ? process3.getuid() : 1e3;
-    const gid = typeof process3.getgid === "function" ? process3.getgid() : 1e3;
-    if (uid === 0 || gid === 0) {
-      throw new CanaryError(
-        "infrastructure",
-        "docker",
-        "Downstream Canary refuses to map containers to a root host user or group."
-      );
-    }
-    const environment = {
-      CI: "1",
-      HOME: "/tmp/home",
-      COREPACK_HOME: "/corepack-home",
-      npm_config_cache: "/canary-cache/npm",
-      npm_config_userconfig: "/dev/null",
-      XDG_CACHE_HOME: "/canary-cache/xdg",
-      NO_COLOR: "1",
-      ...options.extraEnvironment
-    };
-    for (const name2 of Object.keys(environment)) {
-      if (isSecretName(name2)) {
-        throw new CanaryError(
-          "configuration",
-          "configuration",
-          `Refusing to forward secret-like environment variable ${name2}.`
-        );
-      }
-    }
-    const args = [
-      this.#executable,
-      "run",
-      "--rm",
-      "--init",
-      "--name",
-      name,
-      "--user",
-      `${uid}:${gid}`,
-      "--cap-drop",
-      "ALL",
-      "--security-opt",
-      "no-new-privileges=true",
-      "--read-only",
-      "--pids-limit",
-      DOCKER_LIMITS.pids,
-      "--memory",
-      DOCKER_LIMITS.memory,
-      "--memory-swap",
-      DOCKER_LIMITS.memory,
-      "--cpus",
-      DOCKER_LIMITS.cpus,
-      "--network",
-      options.network,
-      "--tmpfs",
-      `/tmp:rw,exec,nosuid,nodev,size=${DOCKER_LIMITS.tmpfsSize}`,
-      "--mount",
-      `type=bind,src=${options.workspace},dst=/workspace`,
-      "--mount",
-      `type=bind,src=${packageCacheDirectory},dst=/canary-cache`,
-      "--mount",
-      `type=bind,src=${corepackDirectory},dst=/corepack-home${options.corepackReadOnly ? ",readonly" : ""}`,
-      "--workdir",
-      "/workspace"
-    ];
-    for (const [key, value] of Object.entries(environment)) {
-      args.push("--env", `${key}=${value}`);
-    }
-    args.push(this.#image, ...options.command);
-    const command = args;
-    const result = await runProcess(command, {
-      environment: await this.#environment(),
-      timeoutMs: options.timeoutSeconds * 1e3
-    });
-    if (result.timedOut || result.exitCode !== 0) {
-      await this.#cleanupContainer(name);
-    }
-    if (!result.timedOut && (result.exitCode === null || result.exitCode === 125)) {
-      throw new CanaryError(
-        "infrastructure",
-        "docker",
-        `Docker could not start or supervise the ${options.phase} container.`,
-        { diagnostic: result.output }
-      );
-    }
-    return result;
-  }
-  async #cleanupContainer(name) {
-    const environment = await this.#environment();
-    await runProcess([this.#executable, "kill", name], {
-      environment,
-      timeoutMs: 1e4
-    });
-    await runProcess([this.#executable, "rm", "--force", name], {
-      environment,
-      timeoutMs: 1e4
-    });
-  }
-  async runtimeInfo(workspace, timeoutSeconds) {
-    const result = await this.run({
-      workspace,
-      timeoutSeconds,
-      network: "none",
-      phase: "runtime-info",
-      command: [
-        "node",
-        "-e",
-        "process.stdout.write(JSON.stringify({node:process.version,platform:process.platform,arch:process.arch}))"
-      ]
-    });
-    if (result.exitCode !== 0) {
-      throw new CanaryError("infrastructure", "docker", "Unable to inspect the runner container.", {
-        diagnostic: result.output
-      });
-    }
-    const value = JSON.parse(result.stdout);
-    if (value.node !== `v${NODE_VERSION}` || value.platform !== "linux") {
-      throw new CanaryError(
-        "infrastructure",
-        "docker",
-        `Pinned runner identity mismatch: ${value.node} ${value.platform}/${value.arch}.`
-      );
-    }
-    return {
-      nodeVersion: value.node,
-      operatingSystem: "linux",
-      architecture: value.arch
-    };
-  }
-  async dispose() {
-    if (this.#configDirectory) {
-      await rm(this.#configDirectory, { recursive: true, force: true });
-      this.#configDirectory = void 0;
-    }
-  }
-};
+  return normalized;
+}
 
-// src/types.ts
-var FIXTURE_LOCAL_PATH = /* @__PURE__ */ Symbol("fixture-local-path");
+// src/util/files.ts
+import { lstat, readdir, readlink } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
+
+// src/util/hash.ts
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+function sha256(data) {
+  return createHash("sha256").update(data).digest("hex");
+}
+async function sha256File(path) {
+  return await new Promise((resolve4, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", () => resolve4(hash.digest("hex")));
+  });
+}
+
+// src/util/files.ts
+function portablePath(path) {
+  return path.split(sep).join("/");
+}
+async function snapshotTree(root, excludedTopLevel = /* @__PURE__ */ new Set([
+  ".git",
+  ".downstream-canary",
+  "node_modules"
+])) {
+  const result = /* @__PURE__ */ new Map();
+  async function visit4(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const absolute = join(directory, entry.name);
+      const relativePath = portablePath(relative(root, absolute));
+      const topLevel = relativePath.split("/")[0] ?? relativePath;
+      if (excludedTopLevel.has(topLevel)) continue;
+      if (entry.isDirectory()) {
+        await visit4(absolute);
+      } else if (entry.isSymbolicLink()) {
+        result.set(relativePath, `symlink:${await readlink(absolute)}`);
+      } else if (entry.isFile()) {
+        const metadata = await lstat(absolute);
+        result.set(relativePath, `file:${metadata.mode & 511}:${await sha256File(absolute)}`);
+      } else {
+        result.set(relativePath, `unsupported:${entry.name}`);
+      }
+    }
+  }
+  await visit4(root);
+  return result;
+}
+function diffSnapshots(before, after) {
+  const added = [...after.keys()].filter((path) => !before.has(path)).sort();
+  const removed = [...before.keys()].filter((path) => !after.has(path)).sort();
+  const changed = [...before.keys()].filter((path) => after.has(path) && before.get(path) !== after.get(path)).sort();
+  return { added, removed, changed };
+}
+async function validateLaneOutputs(options) {
+  const trackedViolations = [];
+  for (const [path, originalIdentity] of options.originalTracked) {
+    if (options.protectedPaths.has(path)) continue;
+    const actualIdentity = options.after.get(path);
+    if (actualIdentity === void 0) trackedViolations.push(`removed:${path}`);
+    else if (actualIdentity !== originalIdentity) {
+      trackedViolations.push(`changed:${path}`);
+    }
+  }
+  if (trackedViolations.length > 0) {
+    throw new CanaryError(
+      "unsupported-project",
+      options.phase,
+      `${options.lane} install or test modified tracked files: ${trackedViolations.join(", ")}.`
+    );
+  }
+  const protectedViolations = [];
+  for (const path of options.protectedPaths) {
+    const expected = options.protectedExpected.get(path);
+    const actual = options.after.get(path);
+    if (expected === void 0) {
+      if (actual !== void 0) protectedViolations.push(`added:${path}`);
+    } else if (actual === void 0) {
+      protectedViolations.push(`removed:${path}`);
+    } else if (actual !== expected) {
+      protectedViolations.push(`changed:${path}`);
+    }
+  }
+  if (protectedViolations.length > 0) {
+    throw new CanaryError(
+      "unsupported-project",
+      options.phase,
+      `${options.lane} install or test modified protected files: ${protectedViolations.join(", ")}.`
+    );
+  }
+  const generatedNames = [...options.after.keys()].filter((path) => !options.originalTracked.has(path)).sort();
+  if (generatedNames.length > MAX_GENERATED_FILES_PER_LANE) {
+    throw new CanaryError(
+      "unsupported-project",
+      options.phase,
+      `${options.lane} generated ${generatedNames.length} files, exceeding the ${MAX_GENERATED_FILES_PER_LANE}-file limit.`
+    );
+  }
+  const generated = [];
+  let totalBytes = 0;
+  for (const path of generatedNames) {
+    if (options.protectedPaths.has(path)) continue;
+    const metadata = await lstat(join(options.root, ...path.split("/")));
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new CanaryError(
+        "unsupported-project",
+        options.phase,
+        `${options.lane} generated path ${path} is not an ordinary regular file.`
+      );
+    }
+    totalBytes += metadata.size;
+    if (totalBytes > MAX_GENERATED_BYTES_PER_LANE) {
+      throw new CanaryError(
+        "unsupported-project",
+        options.phase,
+        `${options.lane} generated output exceeds the ${MAX_GENERATED_BYTES_PER_LANE}-byte limit.`
+      );
+    }
+    generated.push({ path, sizeBytes: metadata.size });
+  }
+  return generated;
+}
+
+// src/util/stable-json.ts
+function normalize(value, seen) {
+  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalize(item, seen));
+  }
+  if (typeof value === "object") {
+    if (seen.has(value)) throw new TypeError("Cannot serialize a circular value");
+    seen.add(value);
+    const record = value;
+    const normalized = /* @__PURE__ */ Object.create(null);
+    for (const key of Object.keys(record).sort()) {
+      const item = record[key];
+      if (item !== void 0) normalized[key] = normalize(item, seen);
+    }
+    seen.delete(value);
+    return normalized;
+  }
+  throw new TypeError(`Unsupported JSON value: ${typeof value}`);
+}
+function stableStringify(value, spacing = 2) {
+  return `${JSON.stringify(normalize(value, /* @__PURE__ */ new Set()), null, spacing)}
+`;
+}
 
 // src/package-manager.ts
-import { lstat, readFile } from "node:fs/promises";
+import { lstat as lstat2, readFile } from "node:fs/promises";
 import { basename, join as join2 } from "node:path";
 
 // node_modules/yaml/browser/dist/nodes/identity.js
@@ -6733,7 +6700,7 @@ function parse(src, reviver, options) {
 }
 
 // src/validation.ts
-import { isAbsolute as isAbsolute2, normalize, sep } from "node:path";
+import { isAbsolute as isAbsolute3, normalize as normalize2, sep as sep2 } from "node:path";
 var FULL_SHA = /^[0-9a-f]{40}$/;
 var EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 var PACKAGE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -6788,15 +6755,15 @@ function validateExactVersion(value, label) {
   return value;
 }
 function validateRelativeWorkingDirectory(value) {
-  if (value.length === 0 || value.includes("\0") || isAbsolute2(value)) {
+  if (value.length === 0 || value.includes("\0") || isAbsolute3(value)) {
     throw new CanaryError(
       "configuration",
       "configuration",
       `Working directory must be a non-empty safe relative path, received ${JSON.stringify(value)}.`
     );
   }
-  const normalized = normalize(value);
-  if (normalized === ".." || normalized.startsWith(`..${sep}`)) {
+  const normalized = normalize2(value);
+  if (normalized === ".." || normalized.startsWith(`..${sep2}`)) {
     throw new CanaryError(
       "configuration",
       "configuration",
@@ -6806,7 +6773,7 @@ function validateRelativeWorkingDirectory(value) {
   return normalized;
 }
 function validateSafePackageName(value) {
-  if (value.length === 0 || value.length > 214 || value.includes("\0") || value.includes("\\") || isAbsolute2(value)) {
+  if (value.length === 0 || value.length > 214 || value.includes("\0") || value.includes("\\") || isAbsolute3(value)) {
     throw new CanaryError(
       "configuration",
       "configuration",
@@ -6845,7 +6812,7 @@ function isPlainObject(value) {
 // src/package-manager.ts
 async function metadataIfPresent(path) {
   try {
-    return await lstat(path);
+    return await lstat2(path);
   } catch (error) {
     if (error.code === "ENOENT") return void 0;
     throw error;
@@ -6990,7 +6957,14 @@ function validateYarnRegistryConfiguration(value, path = ".yarnrc.yml") {
   }
 }
 function parsePackageManagerDeclaration(declaration) {
-  const match = /^(npm|pnpm|yarn)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+sha(?:224|256|384|512)\.[A-Za-z0-9+/=]+)?$/.exec(
+  if (/^(?:npm|pnpm|yarn)@[^\s]+\+sha(?:224|256|384|512)\./.test(declaration)) {
+    throw new CanaryError(
+      "unsupported-project",
+      "configuration",
+      "packageManager integrity suffixes are rejected in v0.1 because their bytes are not yet independently verified."
+    );
+  }
+  const match = /^(npm|pnpm|yarn)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(
     declaration
   );
   if (!match?.[1] || !match[2]) {
@@ -7044,48 +7018,14 @@ function managerCommands(name, version) {
       };
   }
 }
-function hasArgument(command, expected, expectedValue) {
-  const arguments_ = command.slice(2);
-  if (expectedValue === void 0) return arguments_.includes(expected);
-  return arguments_.includes(`${expected}=${expectedValue}`) || arguments_.some(
-    (argument, index) => argument === expected && arguments_[index + 1] === expectedValue
-  );
-}
-function validateManagerCommandOverride(command, name, version, kind) {
-  if (command[0] !== "corepack" || command[1] !== `${name}@${version}`) {
-    throw new CanaryError(
-      "configuration",
-      "configuration",
-      `Explicit ${kind}Command must invoke corepack ${name}@${version} so the executed package-manager version remains exact.`
-    );
-  }
-  const forbiddenArguments = /* @__PURE__ */ new Set([
-    "--force",
-    "--legacy-peer-deps",
-    "--no-package-lock",
-    "--package-lock=false",
-    "--frozen-lockfile=false",
-    "--no-frozen-lockfile",
-    "--immutable=false",
-    "--no-immutable"
-  ]);
-  if (command.some((argument) => forbiddenArguments.has(argument))) {
-    throw new CanaryError(
-      "configuration",
-      "configuration",
-      `Explicit ${kind}Command contains a validation-bypassing package-manager flag.`
-    );
-  }
-  const valid = kind === "install" ? name === "npm" ? hasArgument(command, "ci") : name === "pnpm" ? hasArgument(command, "install") && hasArgument(command, "--frozen-lockfile") : hasArgument(command, "install") && hasArgument(command, "--immutable") : name === "npm" ? hasArgument(command, "install") && hasArgument(command, "--package-lock-only") : name === "pnpm" ? hasArgument(command, "install") && hasArgument(command, "--lockfile-only") : hasArgument(command, "install") && hasArgument(command, "--mode", "update-lockfile");
-  if (!valid) {
-    throw new CanaryError(
-      "configuration",
-      "configuration",
-      `Explicit ${kind}Command does not preserve the required ${name} ${kind === "install" ? "frozen installation" : "lockfile-only generation"} contract.`
-    );
-  }
-}
 async function validateProjectConfiguration(projectDirectory, manager) {
+  if (await metadataIfPresent(join2(projectDirectory, ".corepack.env"))) {
+    throw new CanaryError(
+      "unsupported-project",
+      "configuration",
+      "Project .corepack.env files are unsupported; Downstream Canary sets COREPACK_ENV_FILE=0 and fails closed."
+    );
+  }
   const npmrcPath = join2(projectDirectory, ".npmrc");
   if (await regularFileExists(npmrcPath, "Project .npmrc")) {
     const npmrc = await readFile(npmrcPath, "utf8");
@@ -7235,22 +7175,6 @@ async function detectPackageManager(projectDirectory, workingDirectory, override
     `${name} version`
   );
   const defaults = managerCommands(name, requestedVersion);
-  if (overrides.installCommand) {
-    validateManagerCommandOverride(
-      overrides.installCommand,
-      name,
-      requestedVersion,
-      "install"
-    );
-  }
-  if (overrides.lockfileCommand) {
-    validateManagerCommandOverride(
-      overrides.lockfileCommand,
-      name,
-      requestedVersion,
-      "lockfile"
-    );
-  }
   if (requireTest && !overrides.testCommand && typeof manifest.scripts?.test !== "string") {
     throw new CanaryError(
       "unsupported-project",
@@ -7266,8 +7190,8 @@ async function detectPackageManager(projectDirectory, workingDirectory, override
     actualVersion: null,
     lockfile: lock.file,
     workingDirectory,
-    immutableInstallCommand: overrides.installCommand ?? defaults.install,
-    lockfileCommand: overrides.lockfileCommand ?? defaults.lockfile,
+    immutableInstallCommand: defaults.install,
+    lockfileCommand: defaults.lockfile,
     testCommand: overrides.testCommand ?? defaults.test
   };
 }
@@ -7290,6 +7214,475 @@ function managerLockfileEnvironment(manager) {
     YARN_ENABLE_SCRIPTS: "false"
   };
 }
+
+// src/docker.ts
+var DOCKER_RUN_LABEL = "io.github.sanmoel.downstream-canary.run-id";
+var DockerRunner = class {
+  #executable;
+  #image;
+  #configDirectory;
+  #dockerHost;
+  #allowContextDiscovery;
+  #runId;
+  #budget;
+  #activeContainers = /* @__PURE__ */ new Set();
+  #cleanupInFlight = /* @__PURE__ */ new Map();
+  #ready = false;
+  #disposePromise;
+  #closing = false;
+  constructor(executable, image, options = {}) {
+    this.#executable = executable;
+    this.#image = image;
+    this.#allowContextDiscovery = options.allowContextDiscovery ?? true;
+    this.#runId = options.runId ?? randomUUID();
+    if (!/^[0-9a-f-]{8,64}$/i.test(this.#runId)) {
+      throw new CanaryError(
+        "configuration",
+        "docker",
+        "Docker run IDs must contain only hexadecimal characters and hyphens."
+      );
+    }
+    this.#budget = options.budget;
+    this.#dockerHost = options.requireLocalDocker ? validateLocalDockerHost(process3.env.DOCKER_HOST) : process3.env.DOCKER_HOST;
+  }
+  get runId() {
+    return this.#runId;
+  }
+  #timeoutMs(requestedMs, phase) {
+    return this.#budget?.timeoutMilliseconds(phase, requestedMs) ?? requestedMs;
+  }
+  #assertOpen() {
+    if (this.#closing) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        "Docker runner cleanup has started; no new containers may be created."
+      );
+    }
+  }
+  async #environment() {
+    this.#configDirectory ??= await mkdtemp(join3(tmpdir(), "downstream-canary-docker-"));
+    return safeHostEnvironment({
+      DOCKER_CONFIG: this.#configDirectory,
+      ...this.#dockerHost ? { DOCKER_HOST: this.#dockerHost } : {}
+    });
+  }
+  async ensureReady() {
+    this.#assertOpen();
+    let environment = await this.#environment();
+    let version = await runProcess(
+      [this.#executable, "version", "--format", "{{.Server.Version}}"],
+      { environment, timeoutMs: this.#timeoutMs(3e4, "Docker readiness check") }
+    );
+    if (version.exitCode !== 0 && !this.#dockerHost && this.#allowContextDiscovery && process3.env.HOME) {
+      const context = await runProcess(
+        [
+          this.#executable,
+          "context",
+          "inspect",
+          "--format",
+          '{{(index .Endpoints "docker").Host}}'
+        ],
+        {
+          environment: safeHostEnvironment({ HOME: process3.env.HOME }),
+          timeoutMs: this.#timeoutMs(3e4, "Docker context discovery")
+        }
+      );
+      const discoveredHost = context.stdout.trim();
+      if (context.exitCode === 0 && /^unix:\/\/.+/.test(discoveredHost)) {
+        this.#dockerHost = discoveredHost;
+        environment = await this.#environment();
+        version = await runProcess(
+          [this.#executable, "version", "--format", "{{.Server.Version}}"],
+          {
+            environment,
+            timeoutMs: this.#timeoutMs(3e4, "Docker readiness check")
+          }
+        );
+      }
+    }
+    if (version.exitCode !== 0) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        "Docker Engine is required and was not reachable.",
+        { diagnostic: version.output }
+      );
+    }
+    const inspect = await runProcess(
+      [this.#executable, "image", "inspect", this.#image],
+      { environment, timeoutMs: this.#timeoutMs(3e4, "Docker image inspection") }
+    );
+    if (inspect.exitCode !== 0) {
+      const pull = await runProcess([this.#executable, "pull", this.#image], {
+        environment,
+        timeoutMs: this.#timeoutMs(10 * 6e4, "Docker image pull")
+      });
+      if (pull.exitCode !== 0) {
+        throw new CanaryError(
+          "infrastructure",
+          "docker",
+          `Unable to pull the pinned runner image ${this.#image}.`,
+          { diagnostic: pull.output }
+        );
+      }
+    }
+    this.#ready = true;
+  }
+  async #provisionDigest(directory) {
+    const snapshot = await snapshotTree(directory, /* @__PURE__ */ new Set());
+    return sha256(stableStringify([...snapshot.entries()]));
+  }
+  async verifyManagerProvision(provision) {
+    const actual = await this.#provisionDigest(provision.corepackDirectory);
+    if (actual !== provision.sha256) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        `The verified ${provision.name}@${provision.version} manager provision changed after it was sealed read-only.`
+      );
+    }
+  }
+  async provisionManager(workspace, cacheDirectory, manager, timeoutSeconds, budget) {
+    this.#assertOpen();
+    const corepackDirectory = join3(cacheDirectory, "corepack");
+    await mkdir(corepackDirectory, { recursive: true });
+    const result = await this.#run(
+      {
+        workspace,
+        cacheDirectory,
+        command: managerVersionCommand(manager),
+        timeoutSeconds,
+        network: "bridge",
+        phase: `provision-${manager.name}-${manager.requestedVersion}`,
+        ...budget ? { budget } : {}
+      },
+      corepackDirectory,
+      false
+    );
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new CanaryError(
+        "infrastructure",
+        result.timedOut ? "timeout" : "docker",
+        `Unable to provision ${manager.name}@${manager.requestedVersion}.`,
+        { diagnostic: result.output }
+      );
+    }
+    const actualVersion = result.stdout.trim();
+    if (actualVersion !== manager.requestedVersion) {
+      throw new CanaryError(
+        "tooling",
+        "configuration",
+        `Requested ${manager.name}@${manager.requestedVersion}, but ${actualVersion} executed.`
+      );
+    }
+    return {
+      name: manager.name,
+      version: actualVersion,
+      corepackDirectory,
+      sha256: await this.#provisionDigest(corepackDirectory)
+    };
+  }
+  async run(options) {
+    this.#assertOpen();
+    const cacheDirectory = options.cacheDirectory ?? join3(options.workspace, ".downstream-canary", "runtime-cache");
+    const corepackDirectory = options.managerProvision?.corepackDirectory ?? join3(cacheDirectory, "empty-corepack");
+    await mkdir(corepackDirectory, { recursive: true });
+    if (options.managerProvision) {
+      await this.verifyManagerProvision(options.managerProvision);
+    }
+    const result = await this.#run(options, corepackDirectory, true);
+    if (options.managerProvision) {
+      await this.verifyManagerProvision(options.managerProvision);
+    }
+    return result;
+  }
+  async #run(options, corepackDirectory, corepackReadOnly) {
+    const cacheDirectory = options.cacheDirectory ?? join3(options.workspace, ".downstream-canary", "runtime-cache");
+    const packageCacheDirectory = join3(cacheDirectory, "package-cache");
+    await mkdir(packageCacheDirectory, { recursive: true });
+    const name = `downstream-canary-${options.phase.replace(/[^a-z0-9_.-]/gi, "-")}-${randomUUID()}`;
+    const uid = typeof process3.getuid === "function" ? process3.getuid() : 1e3;
+    const gid = typeof process3.getgid === "function" ? process3.getgid() : 1e3;
+    if (uid === 0 || gid === 0) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        "Downstream Canary refuses to map containers to a root host user or group."
+      );
+    }
+    const environment = {
+      CI: "1",
+      HOME: "/tmp/home",
+      COREPACK_HOME: "/corepack-home",
+      COREPACK_ENV_FILE: "0",
+      COREPACK_DEFAULT_TO_LATEST: "0",
+      COREPACK_ENABLE_AUTO_PIN: "0",
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+      COREPACK_NPM_REGISTRY: "https://registry.npmjs.org",
+      npm_config_cache: "/canary-cache/npm",
+      npm_config_userconfig: "/dev/null",
+      npm_config_registry: "https://registry.npmjs.org",
+      XDG_CACHE_HOME: "/canary-cache/xdg",
+      NO_COLOR: "1",
+      ...options.extraEnvironment
+    };
+    for (const name2 of Object.keys(environment)) {
+      if (isSecretName(name2)) {
+        throw new CanaryError(
+          "configuration",
+          "configuration",
+          `Refusing to forward secret-like environment variable ${name2}.`
+        );
+      }
+    }
+    const args = [
+      this.#executable,
+      "run",
+      "--rm",
+      "--init",
+      "--name",
+      name,
+      "--label",
+      `${DOCKER_RUN_LABEL}=${this.#runId}`,
+      "--user",
+      `${uid}:${gid}`,
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges=true",
+      "--read-only",
+      "--pids-limit",
+      DOCKER_LIMITS.pids,
+      "--memory",
+      DOCKER_LIMITS.memory,
+      "--memory-swap",
+      DOCKER_LIMITS.memory,
+      "--cpus",
+      DOCKER_LIMITS.cpus,
+      "--network",
+      options.network,
+      "--tmpfs",
+      `/tmp:rw,exec,nosuid,nodev,size=${DOCKER_LIMITS.tmpfsSize}`,
+      "--mount",
+      `type=bind,src=${options.workspace},dst=/workspace`,
+      "--mount",
+      `type=bind,src=${packageCacheDirectory},dst=/canary-cache`,
+      "--mount",
+      `type=bind,src=${corepackDirectory},dst=/corepack-home${corepackReadOnly ? ",readonly" : ""}`,
+      "--workdir",
+      "/workspace"
+    ];
+    for (const [key, value] of Object.entries(environment)) {
+      args.push("--env", `${key}=${value}`);
+    }
+    args.push(this.#image, ...options.command);
+    const command = args;
+    this.#activeContainers.add(name);
+    let result;
+    try {
+      result = await runProcess(command, {
+        environment: await this.#environment(),
+        timeoutMs: this.#timeoutMs(
+          options.budget?.timeoutMilliseconds(
+            `Docker phase ${options.phase}`,
+            options.timeoutSeconds * 1e3
+          ) ?? options.timeoutSeconds * 1e3,
+          `Docker phase ${options.phase}`
+        )
+      });
+    } finally {
+      await this.#cleanupContainer(name);
+    }
+    if (!result.timedOut && (result.exitCode === null || result.exitCode === 125)) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        `Docker could not start or supervise the ${options.phase} container.`,
+        { diagnostic: result.output }
+      );
+    }
+    return result;
+  }
+  async #inspectContainer(name) {
+    const environment = await this.#environment();
+    const result = await runProcess(
+      [this.#executable, "container", "inspect", "--format", "{{.Id}}", name],
+      {
+        environment,
+        timeoutMs: 1e4
+      }
+    );
+    if (result.exitCode === 0 && !result.timedOut) return true;
+    if (!result.timedOut && result.exitCode !== null && /no such (?:object|container)/i.test(result.output)) {
+      return false;
+    }
+    throw new CanaryError(
+      "infrastructure",
+      "docker",
+      `Unable to verify cleanup of container ${name}.`,
+      { diagnostic: result.output }
+    );
+  }
+  async #cleanupContainerAttempt(name) {
+    const diagnostics = [];
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      if (!await this.#inspectContainer(name)) {
+        this.#activeContainers.delete(name);
+        return;
+      }
+      const environment = await this.#environment();
+      const kill = await runProcess([this.#executable, "kill", name], {
+        environment,
+        timeoutMs: 1e4
+      });
+      if (kill.exitCode !== 0 && !/no such (?:object|container)|is not running/i.test(kill.output)) {
+        diagnostics.push(`kill attempt ${attempt}: ${kill.output}`);
+      }
+      const remove = await runProcess(
+        [this.#executable, "rm", "--force", name],
+        {
+          environment,
+          timeoutMs: 1e4
+        }
+      );
+      if (remove.exitCode !== 0 && !/no such (?:object|container)/i.test(remove.output)) {
+        diagnostics.push(`remove attempt ${attempt}: ${remove.output}`);
+      }
+      if (!await this.#inspectContainer(name)) {
+        this.#activeContainers.delete(name);
+        return;
+      }
+      await new Promise((resolveDelay) => {
+        setTimeout(resolveDelay, 100 * attempt);
+      });
+    }
+    throw new CanaryError(
+      "infrastructure",
+      "docker",
+      `Container ${name} remained after three verified cleanup attempts.`,
+      { diagnostic: diagnosticExcerpt(diagnostics.join("\n")) }
+    );
+  }
+  async #cleanupContainer(name) {
+    const existing = this.#cleanupInFlight.get(name);
+    if (existing) return await existing;
+    const cleanup = this.#cleanupContainerAttempt(name).finally(() => {
+      this.#cleanupInFlight.delete(name);
+    });
+    this.#cleanupInFlight.set(name, cleanup);
+    return await cleanup;
+  }
+  async #containersForRun() {
+    const result = await runProcess(
+      [
+        this.#executable,
+        "container",
+        "ls",
+        "--all",
+        "--quiet",
+        "--filter",
+        `label=${DOCKER_RUN_LABEL}=${this.#runId}`
+      ],
+      {
+        environment: await this.#environment(),
+        timeoutMs: 1e4
+      }
+    );
+    if (result.timedOut || result.exitCode !== 0) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        "Unable to perform the final run-label container sweep.",
+        { diagnostic: result.output }
+      );
+    }
+    const identifiers = result.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (identifiers.some((identifier) => !/^[0-9a-f]{12,64}$/i.test(identifier))) {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        "Docker returned an invalid container identifier during cleanup."
+      );
+    }
+    return identifiers;
+  }
+  async #dispose() {
+    let cleanupError;
+    try {
+      if (this.#ready || this.#activeContainers.size > 0) {
+        for (const name of [...this.#activeContainers]) {
+          await this.#cleanupContainer(name);
+        }
+        for (const identifier of await this.#containersForRun()) {
+          await this.#cleanupContainer(identifier);
+        }
+        const remaining = await this.#containersForRun();
+        if (remaining.length > 0) {
+          throw new CanaryError(
+            "infrastructure",
+            "docker",
+            `Final cleanup left ${remaining.length} run-labeled container(s).`
+          );
+        }
+      }
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (this.#configDirectory) {
+      await rm(this.#configDirectory, { recursive: true, force: true });
+      this.#configDirectory = void 0;
+    }
+    if (cleanupError) {
+      throw cleanupError instanceof Error ? cleanupError : new CanaryError(
+        "infrastructure",
+        "docker",
+        "Container cleanup failed with a non-error value."
+      );
+    }
+  }
+  async runtimeInfo(workspace, timeoutSeconds) {
+    const result = await this.run({
+      workspace,
+      timeoutSeconds,
+      network: "none",
+      phase: "runtime-info",
+      command: [
+        "node",
+        "-e",
+        "process.stdout.write(JSON.stringify({node:process.version,platform:process.platform,arch:process.arch}))"
+      ]
+    });
+    if (result.exitCode !== 0) {
+      throw new CanaryError("infrastructure", "docker", "Unable to inspect the runner container.", {
+        diagnostic: result.output
+      });
+    }
+    const value = JSON.parse(result.stdout);
+    if (value.node !== `v${NODE_VERSION}` || value.platform !== "linux") {
+      throw new CanaryError(
+        "infrastructure",
+        "docker",
+        `Pinned runner identity mismatch: ${value.node} ${value.platform}/${value.arch}.`
+      );
+    }
+    return {
+      nodeVersion: value.node,
+      operatingSystem: "linux",
+      architecture: value.arch
+    };
+  }
+  async dispose() {
+    if (!this.#disposePromise) {
+      this.#closing = true;
+      this.#disposePromise = this.#dispose();
+    }
+    await this.#disposePromise;
+  }
+};
+
+// src/types.ts
+var FIXTURE_LOCAL_PATH = /* @__PURE__ */ Symbol("fixture-local-path");
 
 // fixtures/factory.ts
 function tarHeader(path, body) {
@@ -7335,44 +7728,79 @@ function candidateManifest() {
     version: "1.0.0",
     private: true,
     main: "index.cjs",
+    files: ["index.cjs"],
     packageManager: `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-    scripts: { test: "node test.cjs" }
+    devDependencies: {
+      "environment-probe": "file:vendor/environment-probe.tgz"
+    },
+    scripts: {
+      build: "node environment-check.cjs",
+      test: "node test.cjs"
+    }
   };
 }
-function npmLock(manifest) {
-  return `${JSON.stringify(
-    {
-      name: manifest.name,
-      version: manifest.version,
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        "": {
-          name: manifest.name,
-          version: manifest.version
-        }
-      }
-    },
-    null,
-    2
-  )}
+function environmentCheckSource(label) {
+  return `const assert=require('node:assert/strict');for(const [name,value] of Object.entries(process.env)){assert.doesNotMatch(name,/TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH/i);assert.notEqual(value,'downstream-canary-secret-sentinel')}console.log(${JSON.stringify(`${label}: secret isolation pass`)});
 `;
 }
-async function createCandidate(root, name, compatible) {
-  const directory = join3(root, name);
-  await mkdir2(directory, { recursive: true });
-  const manifest = candidateManifest();
-  await writeFile(join3(directory, "package.json"), `${JSON.stringify(manifest, null, 2)}
-`);
-  await writeFile(join3(directory, "package-lock.json"), npmLock(manifest));
+function environmentProbeTarball() {
+  const manifest = Buffer.from(
+    `${JSON.stringify(
+      {
+        name: "environment-probe",
+        version: "1.0.0",
+        scripts: { preinstall: "node check.cjs" }
+      },
+      null,
+      2
+    )}
+`
+  );
+  const implementation = Buffer.from(
+    environmentCheckSource("candidate dependency install")
+  );
+  const tar = Buffer.concat([
+    tarHeader("package/package.json", manifest),
+    tarHeader("package/check.cjs", implementation),
+    Buffer.alloc(1024)
+  ]);
+  return gzipSync(tar);
+}
+async function createCandidate(root, docker, managerProvision, name, compatible) {
+  const directory = join4(root, name);
+  await mkdir2(join4(directory, "vendor"), { recursive: true });
   await writeFile(
-    join3(directory, "index.cjs"),
+    join4(directory, "vendor", "environment-probe.tgz"),
+    environmentProbeTarball()
+  );
+  const manifest = candidateManifest();
+  await writeFile(join4(directory, "package.json"), `${JSON.stringify(manifest, null, 2)}
+`);
+  await writeFile(
+    join4(directory, "index.cjs"),
     compatible ? "exports.parse = value => ({ value });\n" : "exports.parse = value => ({ text: value });\n"
   );
   await writeFile(
-    join3(directory, "test.cjs"),
+    join4(directory, "test.cjs"),
     compatible ? "const assert=require('node:assert/strict');assert.deepEqual(require('./').parse('ok'),{value:'ok'});console.log('candidate library tests: pass');\n" : "const assert=require('node:assert/strict');assert.deepEqual(require('./').parse('ok'),{text:'ok'});console.log('candidate library tests: pass');\n"
   );
+  await writeFile(
+    join4(directory, "environment-check.cjs"),
+    environmentCheckSource("candidate install/build")
+  );
+  const lockfile = await docker.run({
+    workspace: directory,
+    cacheDirectory: join4(root, `${name}-lock-cache`),
+    command: lockfileGenerationCommand("npm"),
+    timeoutSeconds: 180,
+    network: "bridge",
+    phase: `${name}-fixture-lock`,
+    managerProvision,
+    extraEnvironment: managerLockfileEnvironment({ name: "npm" })
+  });
+  if (lockfile.exitCode !== 0) {
+    throw new Error(`Unable to create ${name} lockfile: ${lockfile.output}`);
+  }
   return { root: directory, workingDirectory: "." };
 }
 function testSource(expectation) {
@@ -7380,6 +7808,9 @@ function testSource(expectation) {
     case "compatible":
     case "regression":
       return "const assert=require('node:assert/strict');assert.deepEqual(require('tiny-parser').parse('hello'),{value:'hello'});console.log('downstream test: pass');\n";
+    case "coverage":
+      return `const assert=require('node:assert/strict');const fs=require('node:fs');fs.mkdirSync('coverage',{recursive:true});fs.writeFileSync('coverage/summary.json','{\\"covered\\":true}\\n');assert.deepEqual(require('tiny-parser').parse('hello'),{value:'hello'});console.log('coverage-producing downstream test: pass');
+`;
     case "preexisting":
       return "const assert=require('node:assert/strict');assert.deepEqual(require('tiny-parser').parse('hello'),{missing:'hello'});\n";
     case "improvement":
@@ -7457,10 +7888,10 @@ async function commitRepository(directory) {
   if (result.exitCode !== 0) throw new Error(result.output);
   return result.stdout.trim();
 }
-async function createConsumer(root, docker, id, manager, expectation) {
-  const directory = join3(root, id);
-  await mkdir2(join3(directory, "vendor"), { recursive: true });
-  await writeFile(join3(directory, "vendor", "tiny-parser-1.0.0.tgz"), baselineTarball());
+async function createConsumer(root, docker, id, manager, expectation, managerProvision) {
+  const directory = join4(root, id);
+  await mkdir2(join4(directory, "vendor"), { recursive: true });
+  await writeFile(join4(directory, "vendor", "tiny-parser-1.0.0.tgz"), baselineTarball());
   const manifest = {
     name: id,
     version: "1.0.0",
@@ -7468,23 +7899,31 @@ async function createConsumer(root, docker, id, manager, expectation) {
     packageManager: `${manager}@${DEFAULT_PACKAGE_MANAGER_VERSIONS[manager]}`,
     scripts: { test: "node test.cjs" }
   };
+  if (expectation === "security") {
+    manifest.scripts.preinstall = "node environment-check.cjs";
+    await writeFile(
+      join4(directory, "environment-check.cjs"),
+      environmentCheckSource("consumer install")
+    );
+  }
   if (expectation !== "injection-failure") {
     manifest.dependencies = { "tiny-parser": "file:vendor/tiny-parser-1.0.0.tgz" };
   }
-  await writeFile(join3(directory, "package.json"), `${JSON.stringify(manifest, null, 2)}
+  await writeFile(join4(directory, "package.json"), `${JSON.stringify(manifest, null, 2)}
 `);
-  await writeFile(join3(directory, "test.cjs"), testSource(expectation));
+  await writeFile(join4(directory, "test.cjs"), testSource(expectation));
   if (manager === "yarn") {
-    await writeFile(join3(directory, ".yarnrc.yml"), "nodeLinker: node-modules\n");
-    await writeFile(join3(directory, ".gitignore"), ".yarn/install-state.gz\nnode_modules/\n");
+    await writeFile(join4(directory, ".yarnrc.yml"), "nodeLinker: node-modules\n");
+    await writeFile(join4(directory, ".gitignore"), ".yarn/install-state.gz\nnode_modules/\n");
   }
   const result = await docker.run({
     workspace: directory,
-    cacheDirectory: join3(root, `${id}-lock-cache`),
+    cacheDirectory: join4(root, `${id}-lock-cache`),
     command: lockfileGenerationCommand(manager),
     timeoutSeconds: 180,
     network: "bridge",
     phase: `${id}-fixture-lock`,
+    managerProvision,
     extraEnvironment: managerLockfileEnvironment({ name: manager })
   });
   if (result.exitCode !== 0) {
@@ -7503,14 +7942,39 @@ async function createConsumer(root, docker, id, manager, expectation) {
   };
 }
 async function createFixtureWorld(dockerExecutable = "docker") {
-  const root = await mkdtemp2(join3(tmpdir2(), "downstream-canary-fixtures-"));
+  const root = await mkdtemp2(join4(tmpdir2(), "downstream-canary-fixtures-"));
   const docker = new DockerRunner(dockerExecutable, RUNNER_IMAGE);
   try {
     await docker.ensureReady();
-    const candidateBreaking = await createCandidate(root, "candidate-breaking", false);
-    const candidateCompatible = await createCandidate(root, "candidate-compatible", true);
+    const managerProvisions = {};
+    for (const manager of ["npm", "pnpm", "yarn"]) {
+      managerProvisions[manager] = await docker.provisionManager(
+        root,
+        join4(root, `.fixture-${manager}-manager`),
+        {
+          name: manager,
+          requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS[manager]
+        },
+        180
+      );
+    }
+    const candidateBreaking = await createCandidate(
+      root,
+      docker,
+      managerProvisions.npm,
+      "candidate-breaking",
+      false
+    );
+    const candidateCompatible = await createCandidate(
+      root,
+      docker,
+      managerProvisions.npm,
+      "candidate-compatible",
+      true
+    );
     const definitions = [
       ["npm-compatible", "npm", "compatible"],
+      ["npm-coverage", "npm", "coverage"],
       ["npm-regression", "npm", "regression"],
       ["pnpm-compatible", "pnpm", "compatible"],
       ["pnpm-regression", "pnpm", "regression"],
@@ -7523,7 +7987,14 @@ async function createFixtureWorld(dockerExecutable = "docker") {
     ];
     const consumers = {};
     for (const [id, manager, expectation] of definitions) {
-      consumers[id] = await createConsumer(root, docker, id, manager, expectation);
+      consumers[id] = await createConsumer(
+        root,
+        docker,
+        id,
+        manager,
+        expectation,
+        managerProvisions[manager]
+      );
     }
     return { root, candidateBreaking, candidateCompatible, consumers };
   } catch (error) {
@@ -7542,31 +8013,13 @@ import { join as join11 } from "node:path";
 import { tmpdir as tmpdir4 } from "node:os";
 
 // src/candidate.ts
-import { cp, lstat as lstat3, mkdir as mkdir3, readdir, realpath } from "node:fs/promises";
-import { basename as basename2, join as join4, relative, resolve, sep as sep2 } from "node:path";
+import { cp, lstat as lstat4, mkdir as mkdir3, readdir as readdir2, realpath } from "node:fs/promises";
+import { basename as basename2, join as join5, relative as relative2, resolve, sep as sep3 } from "node:path";
 
 // src/tarball.ts
 import { gunzipSync } from "node:zlib";
 import { posix } from "node:path";
-import { lstat as lstat2, readFile as readFile2 } from "node:fs/promises";
-
-// src/util/hash.ts
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-function sha256(data) {
-  return createHash("sha256").update(data).digest("hex");
-}
-async function sha256File(path) {
-  return await new Promise((resolve4, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(path);
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.once("error", reject);
-    stream.once("end", () => resolve4(hash.digest("hex")));
-  });
-}
-
-// src/tarball.ts
+import { lstat as lstat3, readFile as readFile2 } from "node:fs/promises";
 function stringField(header, start, length) {
   const field = header.subarray(start, start + length);
   const zero = field.indexOf(0);
@@ -7825,7 +8278,7 @@ function parseTar(archive) {
   return entries;
 }
 async function validateCandidateTarball(tarballPath, options) {
-  const metadata = await lstat2(tarballPath);
+  const metadata = await lstat3(tarballPath);
   if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_TARBALL_BYTES) {
     throw new CanaryError(
       "tooling",
@@ -7955,9 +8408,9 @@ async function copyCandidateSource(source, destination) {
     dereference: false,
     preserveTimestamps: true,
     filter: (path) => {
-      const relativePath = relative(source, path);
+      const relativePath = relative2(source, path);
       if (relativePath === "") return true;
-      return !relativePath.split(sep2).some((component) => COPY_EXCLUSIONS.has(component));
+      return !relativePath.split(sep3).some((component) => COPY_EXCLUSIONS.has(component));
     }
   });
 }
@@ -7973,27 +8426,7 @@ function requireSuccess(result, message) {
     });
   }
 }
-async function identifyManager(docker, manager, workspace, cacheDirectory, timeoutSeconds) {
-  const versionResult = await docker.run({
-    workspace,
-    cacheDirectory,
-    command: managerVersionCommand(manager),
-    timeoutSeconds,
-    network: "bridge",
-    phase: "candidate-manager-version"
-  });
-  requireSuccess(versionResult, `Unable to run ${manager.name}@${manager.requestedVersion}.`);
-  const actualVersion = versionResult.stdout.trim();
-  if (actualVersion !== manager.requestedVersion) {
-    throw new CanaryError(
-      "tooling",
-      "configuration",
-      `Requested ${manager.name}@${manager.requestedVersion}, but ${actualVersion} executed.`
-    );
-  }
-  return { ...manager, actualVersion };
-}
-async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
+async function buildCandidate(config, docker, temporaryRoot, budget) {
   const sourceRoot = resolve(config.root);
   const workingDirectory = validateRelativeWorkingDirectory(config.workingDirectory);
   if (workingDirectory !== ".") {
@@ -8004,15 +8437,15 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
     );
   }
   const sourceProject = resolve(sourceRoot, workingDirectory);
-  const relativeProject = relative(sourceRoot, sourceProject);
-  if (relativeProject === ".." || relativeProject.startsWith(`..${sep2}`)) {
+  const relativeProject = relative2(sourceRoot, sourceProject);
+  if (relativeProject === ".." || relativeProject.startsWith(`..${sep3}`)) {
     throw new CanaryError(
       "configuration",
       "configuration",
       "Candidate working directory escapes the candidate root."
     );
   }
-  const rootMetadata = await lstat3(sourceRoot).catch((error) => {
+  const rootMetadata = await lstat4(sourceRoot).catch((error) => {
     throw new CanaryError(
       "configuration",
       "configuration",
@@ -8020,7 +8453,7 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
       { cause: error }
     );
   });
-  const projectMetadata = await lstat3(sourceProject).catch((error) => {
+  const projectMetadata = await lstat4(sourceProject).catch((error) => {
     throw new CanaryError(
       "configuration",
       "configuration",
@@ -8037,8 +8470,8 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
   }
   const realSourceRoot = await realpath(sourceRoot);
   const realSourceProject = await realpath(sourceProject);
-  const realRelativeProject = relative(realSourceRoot, realSourceProject);
-  if (realRelativeProject === ".." || realRelativeProject.startsWith(`..${sep2}`)) {
+  const realRelativeProject = relative2(realSourceRoot, realSourceProject);
+  if (realRelativeProject === ".." || realRelativeProject.startsWith(`..${sep3}`)) {
     throw new CanaryError(
       "configuration",
       "configuration",
@@ -8062,11 +8495,11 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
     );
   }
   validatePackageVersion(manifest.version);
-  const checkout = join4(temporaryRoot, "candidate-source");
+  const checkout = join5(temporaryRoot, "candidate-source");
   await copyCandidateSource(sourceRoot, checkout);
   const project = resolve(checkout, workingDirectory);
-  const cacheDirectory = join4(temporaryRoot, "candidate-cache");
-  const outputDirectory = join4(cacheDirectory, "package-cache", "packed");
+  const cacheDirectory = join5(temporaryRoot, "candidate-cache");
+  const outputDirectory = join5(cacheDirectory, "package-cache", "packed");
   await mkdir3(outputDirectory, { recursive: true });
   let manager = await detectPackageManager(
     project,
@@ -8074,22 +8507,24 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
     config,
     false
   );
-  manager = await identifyManager(
-    docker,
-    manager,
+  const managerProvision = await docker.provisionManager(
     project,
-    cacheDirectory,
-    timeoutSeconds
+    join5(temporaryRoot, "candidate-manager-provision"),
+    manager,
+    budget.timeoutSeconds("candidate package-manager provisioning"),
+    budget
   );
+  manager = { ...manager, actualVersion: managerProvision.version };
   const install = await docker.run({
     workspace: project,
     cacheDirectory,
     command: manager.immutableInstallCommand,
-    timeoutSeconds,
+    timeoutSeconds: budget.timeoutSeconds("candidate dependency installation"),
     network: "bridge",
     phase: "candidate-build-install",
-    corepackReadOnly: true,
-    extraEnvironment: managerEnvironment(manager)
+    managerProvision,
+    extraEnvironment: managerEnvironment(manager),
+    budget
   });
   requireSuccess(install, "Candidate dependency installation failed.");
   const copiedManifest = await readManifest(project);
@@ -8099,32 +8534,25 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
       workspace: project,
       cacheDirectory,
       command: buildCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds("candidate build"),
       network: "none",
       phase: "candidate-build",
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(manager)
+      managerProvision,
+      extraEnvironment: managerEnvironment(manager),
+      budget
     });
     requireSuccess(build, `Candidate build failed: ${diagnosticExcerpt(build.output)}`);
   }
-  if (manager.name !== "npm") {
-    const npmWarmup = await docker.run({
-      workspace: project,
-      cacheDirectory,
-      command: [
-        "corepack",
-        `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-        "--version"
-      ],
-      timeoutSeconds,
-      network: "bridge",
-      phase: "candidate-pack-manager"
-    });
-    requireSuccess(
-      npmWarmup,
-      `Unable to provision npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm} for candidate packing.`
-    );
-  }
+  const npmProvision = manager.name === "npm" && manager.requestedVersion === DEFAULT_PACKAGE_MANAGER_VERSIONS.npm ? managerProvision : await docker.provisionManager(
+    project,
+    join5(temporaryRoot, "candidate-pack-manager-provision"),
+    {
+      name: "npm",
+      requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS.npm
+    },
+    budget.timeoutSeconds("candidate pack-manager provisioning"),
+    budget
+  );
   const pack = await docker.run({
     workspace: project,
     cacheDirectory,
@@ -8136,14 +8564,15 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
       "--pack-destination",
       "/canary-cache/packed"
     ],
-    timeoutSeconds,
+    timeoutSeconds: budget.timeoutSeconds("candidate pack"),
     network: "none",
     phase: "candidate-pack",
-    corepackReadOnly: true,
-    extraEnvironment: { npm_config_ignore_scripts: "false" }
+    managerProvision: npmProvision,
+    extraEnvironment: { npm_config_ignore_scripts: "false" },
+    budget
   });
   requireSuccess(pack, "Candidate npm pack failed.");
-  const outputMetadata = await lstat3(outputDirectory).catch((error) => {
+  const outputMetadata = await lstat4(outputDirectory).catch((error) => {
     throw new CanaryError(
       "tooling",
       "configuration",
@@ -8158,7 +8587,7 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
       "Candidate pack output must remain a real directory."
     );
   }
-  const tarballs = (await readdir(outputDirectory)).filter((file) => file.endsWith(".tgz"));
+  const tarballs = (await readdir2(outputDirectory)).filter((file) => file.endsWith(".tgz"));
   if (tarballs.length !== 1 || !tarballs[0]) {
     throw new CanaryError(
       "tooling",
@@ -8167,12 +8596,12 @@ async function buildCandidate(config, docker, temporaryRoot, timeoutSeconds) {
       { diagnostic: pack.output }
     );
   }
-  const tarballPath = join4(outputDirectory, basename2(tarballs[0]));
+  const tarballPath = join5(outputDirectory, basename2(tarballs[0]));
   const artifact = await validateCandidateTarball(tarballPath, {
     expectedName: manifest.name,
     expectedVersion: manifest.version
   });
-  return { artifact, manager };
+  return { artifact, manager, buildCommand: buildCommand ?? null };
 }
 
 // src/consumer.ts
@@ -8181,8 +8610,8 @@ import { join as join9, relative as relative4, resolve as resolve3, sep as sep5 
 import { tmpdir as tmpdir3 } from "node:os";
 
 // src/checkout.ts
-import { lstat as lstat4, mkdir as mkdir4 } from "node:fs/promises";
-import { join as join5 } from "node:path";
+import { lstat as lstat5, mkdir as mkdir4 } from "node:fs/promises";
+import { join as join6 } from "node:path";
 function gitEnvironment(configDirectory) {
   return safeHostEnvironment({
     HOME: configDirectory,
@@ -8210,13 +8639,17 @@ async function git(args, cwd, configDirectory, timeoutMs) {
   }
   return result.stdout.trim();
 }
-async function checkoutConsumer(consumer, destination, configDirectory, timeoutSeconds) {
+async function checkoutConsumer(consumer, destination, configDirectory, budget) {
   validatePublicGitHubUrl(consumer.repositoryUrl);
   validateFullCommitSha(consumer.commit);
   await mkdir4(destination, { recursive: true });
   await mkdir4(configDirectory, { recursive: true });
-  const timeoutMs = timeoutSeconds * 1e3;
-  await git(["init", "--quiet", "--initial-branch=canary"], destination, configDirectory, timeoutMs);
+  await git(
+    ["init", "--quiet", "--initial-branch=canary"],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds("Git checkout initialization")
+  );
   await git(
     [
       "remote",
@@ -8226,16 +8659,26 @@ async function checkoutConsumer(consumer, destination, configDirectory, timeoutS
     ],
     destination,
     configDirectory,
-    timeoutMs
+    budget.timeoutMilliseconds("Git remote configuration")
   );
   await git(
     ["fetch", "--quiet", "--depth=1", "--no-tags", "origin", consumer.commit],
     destination,
     configDirectory,
-    timeoutMs
+    budget.timeoutMilliseconds("Git pinned-commit fetch")
   );
-  await git(["checkout", "--quiet", "--detach", "FETCH_HEAD"], destination, configDirectory, timeoutMs);
-  const actual = await git(["rev-parse", "HEAD"], destination, configDirectory, timeoutMs);
+  await git(
+    ["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds("Git detached checkout")
+  );
+  const actual = await git(
+    ["rev-parse", "HEAD"],
+    destination,
+    configDirectory,
+    budget.timeoutMilliseconds("Git commit verification")
+  );
   if (actual !== consumer.commit) {
     throw new CanaryError(
       "infrastructure",
@@ -8247,7 +8690,7 @@ async function checkoutConsumer(consumer, destination, configDirectory, timeoutS
     ["ls-files", "--stage"],
     destination,
     configDirectory,
-    timeoutMs
+    budget.timeoutMilliseconds("Git submodule inspection")
   );
   if (stagedFiles.split("\n").some((line) => line.startsWith("160000 "))) {
     throw new CanaryError(
@@ -8257,7 +8700,7 @@ async function checkoutConsumer(consumer, destination, configDirectory, timeoutS
     );
   }
   try {
-    await lstat4(join5(destination, ".gitmodules"));
+    await lstat5(join6(destination, ".gitmodules"));
   } catch (error) {
     const code = error.code;
     if (code === "ENOENT") return;
@@ -8289,7 +8732,7 @@ function exitCodeForResults(results) {
 
 // src/dependency.ts
 import { readFile as readFile3, writeFile as writeFile2 } from "node:fs/promises";
-import { join as join6 } from "node:path";
+import { join as join7 } from "node:path";
 
 // node_modules/jsonc-parser/lib/esm/impl/scanner.js
 function createScanner(text, ignoreTrivia = false) {
@@ -9702,7 +10145,7 @@ function planDependencyPatch(manifest, packageName, newSpecifier) {
   };
 }
 async function applyDependencyPatch(projectDirectory, plan) {
-  const manifestPath = join6(projectDirectory, "package.json");
+  const manifestPath = join7(projectDirectory, "package.json");
   const source = await readFile3(manifestPath, "utf8");
   const edits = modify(source, [plan.field, plan.packageName], plan.newSpecifier, {
     formattingOptions: {
@@ -9742,14 +10185,14 @@ async function verifyDependencyPatch(projectDirectory, plan) {
 }
 
 // src/installed.ts
-import { lstat as lstat5, readlink, realpath as realpath2 } from "node:fs/promises";
-import { dirname, join as join7, relative as relative2, resolve as resolve2, sep as sep3 } from "node:path";
+import { lstat as lstat6, readlink as readlink2, realpath as realpath2 } from "node:fs/promises";
+import { dirname, join as join8, relative as relative3, resolve as resolve2, sep as sep4 } from "node:path";
 function packagePath(projectDirectory, packageName) {
-  return join7(projectDirectory, "node_modules", ...packageName.split("/"));
+  return join8(projectDirectory, "node_modules", ...packageName.split("/"));
 }
 function isWithin(parent, child) {
-  const path = relative2(parent, child);
-  return path === "" || !path.startsWith(`..${sep3}`) && path !== "..";
+  const path = relative3(parent, child);
+  return path === "" || !path.startsWith(`..${sep4}`) && path !== "..";
 }
 async function verifyInstalledCandidate(projectDirectory, artifact) {
   const logicalRoot = packagePath(projectDirectory, artifact.packageName);
@@ -9774,7 +10217,7 @@ async function verifyInstalledCandidate(projectDirectory, artifact) {
     );
   }
   for (const [path, expectedHash] of Object.entries(artifact.packageFileHashes)) {
-    const installedPath = join7(installedRoot, ...path.split("/"));
+    const installedPath = join8(installedRoot, ...path.split("/"));
     const resolvedInstalledPath = await realpath2(installedPath).catch((error) => {
       throw new CanaryError(
         "tooling",
@@ -9790,7 +10233,7 @@ async function verifyInstalledCandidate(projectDirectory, artifact) {
         `Installed candidate file ${path} resolves outside its package root.`
       );
     }
-    const metadata = await lstat5(installedPath).catch((error) => {
+    const metadata = await lstat6(installedPath).catch((error) => {
       throw new CanaryError(
         "tooling",
         "candidate-verification",
@@ -9823,7 +10266,7 @@ async function verifyInstalledCandidate(projectDirectory, artifact) {
     }
   }
   for (const [path, expectedTarget] of Object.entries(artifact.packageLinks)) {
-    const installedPath = join7(installedRoot, ...path.split("/"));
+    const installedPath = join8(installedRoot, ...path.split("/"));
     const installedParent = await realpath2(dirname(installedPath)).catch(
       (error) => {
         throw new CanaryError(
@@ -9841,8 +10284,8 @@ async function verifyInstalledCandidate(projectDirectory, artifact) {
         `Installed candidate link ${path} has a parent outside its package root.`
       );
     }
-    const metadata = await lstat5(installedPath);
-    if (!metadata.isSymbolicLink() || await readlink(installedPath) !== expectedTarget) {
+    const metadata = await lstat6(installedPath);
+    if (!metadata.isSymbolicLink() || await readlink2(installedPath) !== expectedTarget) {
       throw new CanaryError(
         "tooling",
         "candidate-verification",
@@ -9860,46 +10303,69 @@ async function verifyInstalledCandidate(projectDirectory, artifact) {
   }
 }
 
-// src/util/files.ts
-import { lstat as lstat6, readdir as readdir2, readlink as readlink2 } from "node:fs/promises";
-import { join as join8, relative as relative3, sep as sep4 } from "node:path";
-function portablePath(path) {
-  return path.split(sep4).join("/");
+// src/failure-attribution.ts
+var NETWORK_FAILURE = /\b(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ENETUNREACH|ENOTFOUND|ETIMEDOUT|ERR_SOCKET_TIMEOUT)\b|network (?:error|failure)|socket hang up|fetch failed/i;
+var REGISTRY_FAILURE = /\b(?:E401|E403|E404|ERR_PNPM_FETCH_[0-9]+|YN0035)\b|registry(?:\.npmjs\.org)?[^\n]*(?:unavailable|error|failed)/i;
+var COREPACK_FAILURE = /\bcorepack\b[^\n]*(?:error|failed|unable|download)|cannot find matching keyid|package manager signature/i;
+var RESOLUTION_FAILURE = {
+  npm: /\bERESOLVE\b|unable to resolve dependency tree/i,
+  pnpm: /\bERR_PNPM_(?:PEER_DEP_ISSUES|BAD_PEER_DEPENDENCY|UNSUPPORTED_ENGINE)\b/i,
+  yarn: /\bYN(?:0001|0027|0060|0082|0086)\b[^\n]*(?:resolution|peer|range|version|engine)/i
+};
+var LIFECYCLE_FAILURE = {
+  npm: /(?:npm (?:error|ERR!) command failed|\bELIFECYCLE\b)/i,
+  pnpm: /\bELIFECYCLE\b|lifecycle script failed/i,
+  yarn: /\bYN0009\b|could(?:n't| not) be built successfully/i
+};
+function infrastructureAttribution(output) {
+  if (COREPACK_FAILURE.test(output)) return "corepack";
+  if (NETWORK_FAILURE.test(output)) return "network";
+  if (REGISTRY_FAILURE.test(output)) return "registry";
+  return void 0;
 }
-async function snapshotTree(root, excludedTopLevel = /* @__PURE__ */ new Set([
-  ".git",
-  ".downstream-canary",
-  "node_modules"
-])) {
-  const result = /* @__PURE__ */ new Map();
-  async function visit4(directory) {
-    const entries = await readdir2(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      const absolute = join8(directory, entry.name);
-      const relativePath = portablePath(relative3(root, absolute));
-      const topLevel = relativePath.split("/")[0] ?? relativePath;
-      if (excludedTopLevel.has(topLevel)) continue;
-      if (entry.isDirectory()) {
-        await visit4(absolute);
-      } else if (entry.isSymbolicLink()) {
-        result.set(relativePath, `symlink:${await readlink2(absolute)}`);
-      } else if (entry.isFile()) {
-        const metadata = await lstat6(absolute);
-        result.set(relativePath, `file:${metadata.mode & 511}:${await sha256File(absolute)}`);
-      } else {
-        result.set(relativePath, `unsupported:${entry.name}`);
-      }
-    }
+function candidateLockfileFailureDisposition(result) {
+  const reason = result.timedOut ? "Candidate lockfile generation timed out; no compatibility conclusion is possible." : "Candidate lockfile generation failed; registry, tooling, and resolution causes are not trusted regression evidence.";
+  return {
+    classification: "tool-error",
+    failurePhase: "candidate-lockfile",
+    reason
+  };
+}
+function attributeCandidateInstallFailure(manager, failedInstall, scriptsDisabledInstall) {
+  if (failedInstall.timedOut || scriptsDisabledInstall.timedOut) {
+    return {
+      classification: "tool-error",
+      attribution: "unknown",
+      reason: "Candidate installation or its attribution probe timed out."
+    };
   }
-  await visit4(root);
-  return result;
-}
-function diffSnapshots(before, after) {
-  const added = [...after.keys()].filter((path) => !before.has(path)).sort();
-  const removed = [...before.keys()].filter((path) => !after.has(path)).sort();
-  const changed = [...before.keys()].filter((path) => after.has(path) && before.get(path) !== after.get(path)).sort();
-  return { added, removed, changed };
+  const infrastructure = infrastructureAttribution(scriptsDisabledInstall.output) ?? infrastructureAttribution(failedInstall.output);
+  if (infrastructure) {
+    return {
+      classification: "tool-error",
+      attribution: infrastructure,
+      reason: `Candidate installation has an untrusted ${infrastructure} failure.`
+    };
+  }
+  if (scriptsDisabledInstall.exitCode === 0 && LIFECYCLE_FAILURE[manager].test(failedInstall.output)) {
+    return {
+      classification: "candidate-regression",
+      attribution: "lifecycle-incompatibility",
+      reason: "The frozen install succeeds with lifecycle scripts disabled and fails with a manager-attributed lifecycle error."
+    };
+  }
+  if (scriptsDisabledInstall.exitCode !== 0 && RESOLUTION_FAILURE[manager].test(scriptsDisabledInstall.output)) {
+    return {
+      classification: "candidate-regression",
+      attribution: "dependency-resolution",
+      reason: "The scripts-disabled frozen install reports a package-manager dependency-resolution incompatibility."
+    };
+  }
+  return {
+    classification: "tool-error",
+    attribution: "unknown",
+    reason: "Candidate installation failed without positive dependency-resolution or lifecycle incompatibility evidence."
+  };
 }
 
 // src/consumer.ts
@@ -9990,33 +10456,6 @@ function requireNoUnexpectedChanges(before, after, expectedChanged, message) {
     );
   }
 }
-async function actualManagerVersion(docker, manager, workspace, cacheDirectory, timeoutSeconds) {
-  const result = await docker.run({
-    workspace,
-    cacheDirectory,
-    command: managerVersionCommand(manager),
-    timeoutSeconds,
-    network: "bridge",
-    phase: `${manager.name}-version`
-  });
-  if (result.timedOut || result.exitCode !== 0) {
-    throw new CanaryError(
-      "infrastructure",
-      result.timedOut ? "timeout" : "docker",
-      `Unable to run ${manager.name}@${manager.requestedVersion}.`,
-      { diagnostic: result.output }
-    );
-  }
-  const actual = result.stdout.trim();
-  if (actual !== manager.requestedVersion) {
-    throw new CanaryError(
-      "tooling",
-      "configuration",
-      `Requested ${manager.name}@${manager.requestedVersion}, but ${actual} executed.`
-    );
-  }
-  return actual;
-}
 function testPhase(install, test) {
   return {
     status: test?.exitCode === 0 && !test.timedOut ? "pass" : "fail",
@@ -10037,6 +10476,7 @@ function buildResult(consumer, artifact, runtime, state, classification, failure
     packageManager: state.manager?.name ?? null,
     declaredPackageManagerVersion: state.manager?.declaredVersion ?? null,
     actualPackageManagerVersion: state.manager?.actualVersion ?? null,
+    requestedPackageManagerVersion: state.manager?.requestedVersion ?? null,
     nodeVersion: runtime.nodeVersion,
     operatingSystem: runtime.operatingSystem,
     architecture: runtime.architecture,
@@ -10052,7 +10492,14 @@ function buildResult(consumer, artifact, runtime, state, classification, failure
     candidateLockfileHash: state.candidateLockfileHash,
     dependencyFieldReplaced: state.dependencyFieldReplaced,
     timeoutOrInfrastructureReason: state.infrastructureReason,
-    diagnosticExcerpt: diagnosticExcerpt(state.diagnostic)
+    diagnosticExcerpt: diagnosticExcerpt(state.diagnostic),
+    executedTestCommand: state.testCommand,
+    candidateInstallFailureAttribution: state.candidateInstallFailureAttribution,
+    packageManagerProvisionSha256: state.managerProvisionSha256,
+    generatedPaths: {
+      baseline: state.baselineGeneratedPaths,
+      candidate: state.candidateGeneratedPaths
+    }
   };
 }
 async function cleanNodeModules(project) {
@@ -10067,7 +10514,7 @@ async function cleanNodeModules(project) {
   }
   await rm2(nodeModules, { recursive: true, force: true });
 }
-async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) {
+async function runConsumer(consumer, artifact, docker, runtime, budget) {
   const started = performance.now();
   const root = await mkdtemp3(join9(tmpdir3(), "downstream-canary-consumer-"));
   const state = {
@@ -10078,7 +10525,12 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
     candidateLockfileHash: null,
     dependencyFieldReplaced: null,
     diagnostic: "",
-    infrastructureReason: null
+    infrastructureReason: null,
+    testCommand: null,
+    candidateInstallFailureAttribution: null,
+    managerProvisionSha256: null,
+    baselineGeneratedPaths: [],
+    candidateGeneratedPaths: []
   };
   try {
     const baselineCheckout = join9(root, "baseline-checkout");
@@ -10087,13 +10539,13 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
       consumer,
       baselineCheckout,
       join9(root, "git-config-baseline"),
-      timeoutSeconds
+      budget
     );
     await checkoutConsumer(
       consumer,
       candidateCheckout,
       join9(root, "git-config-candidate"),
-      timeoutSeconds
+      budget
     );
     const baselineProject = await projectPath(
       baselineCheckout,
@@ -10133,29 +10585,32 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
     }
     const originalLockPath = join9(baselineProject, manager.lockfile);
     state.originalLockfileHash = await sha256File(originalLockPath);
-    const baselineCache = join9(root, "baseline-cache");
-    const actualVersion = await actualManagerVersion(
-      docker,
-      manager,
+    const managerProvision = await docker.provisionManager(
       baselineProject,
-      baselineCache,
-      timeoutSeconds
+      join9(root, "manager-provision"),
+      manager,
+      budget.timeoutSeconds("consumer package-manager provisioning"),
+      budget
     );
-    state.manager = { ...manager, actualVersion };
+    state.manager = { ...manager, actualVersion: managerProvision.version };
+    state.managerProvisionSha256 = managerProvision.sha256;
+    const baselineCache = join9(root, "baseline-cache");
+    state.testCommand = manager.testCommand;
     const baselineInstall = await docker.run({
       workspace: baselineProject,
       cacheDirectory: baselineCache,
       command: manager.immutableInstallCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds("baseline dependency installation"),
       network: "bridge",
       phase: "baseline-install",
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(manager)
+      managerProvision,
+      extraEnvironment: managerEnvironment(manager),
+      budget
     });
     appendDiagnostic(state, "baseline install", baselineInstall);
     if (baselineInstall.timedOut || baselineInstall.exitCode !== 0) {
       state.baseline = testPhase(baselineInstall, void 0);
-      state.infrastructureReason = baselineInstall.timedOut ? `Baseline installation exceeded ${timeoutSeconds} seconds.` : "Baseline dependency installation failed, so the comparison is not trustworthy.";
+      state.infrastructureReason = baselineInstall.timedOut ? "Baseline installation exceeded its command or consumer budget." : "Baseline dependency installation failed, so the comparison is not trustworthy.";
       return buildResult(
         consumer,
         artifact,
@@ -10170,25 +10625,39 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
       workspace: baselineProject,
       cacheDirectory: baselineCache,
       command: manager.testCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds("baseline test"),
       network: "none",
       phase: "baseline-test",
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(manager)
+      managerProvision,
+      extraEnvironment: managerEnvironment(manager),
+      budget
     });
     appendDiagnostic(state, "baseline test", baselineTest);
     state.baseline = testPhase(baselineInstall, baselineTest);
     if (baselineTest.timedOut) {
-      state.infrastructureReason = `Baseline test exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = "Baseline test exceeded its command or consumer budget.";
     }
+    const protectedPaths = /* @__PURE__ */ new Set([
+      "package.json",
+      manager.lockfile,
+      ".npmrc",
+      ".yarnrc.yml",
+      ".corepack.env",
+      "pnpm-workspace.yaml",
+      "pnpm-workspace.yml",
+      ".pnp.cjs",
+      ".pnp.loader.mjs"
+    ]);
     const baselineAfter = await snapshotTree(baselineProject);
-    if (!snapshotsEqual(baselineOriginal, baselineAfter)) {
-      throw new CanaryError(
-        "unsupported-project",
-        "baseline-test",
-        "Baseline install or test added, removed, or modified project files; the baseline must remain byte-identical."
-      );
-    }
+    state.baselineGeneratedPaths = await validateLaneOutputs({
+      root: baselineProject,
+      originalTracked: baselineOriginal,
+      after: baselineAfter,
+      protectedExpected: baselineOriginal,
+      protectedPaths,
+      phase: "baseline-test",
+      lane: "Baseline"
+    });
     if (baselineTest.timedOut) {
       return buildResult(
         consumer,
@@ -10230,53 +10699,28 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
       "Candidate manifest patch was not mechanically isolated."
     );
     const candidateCache = join9(root, "candidate-cache");
-    const candidateActualVersion = await actualManagerVersion(
-      docker,
-      candidateManager,
-      candidateProject,
-      candidateCache,
-      timeoutSeconds
-    );
-    if (candidateActualVersion !== actualVersion) {
-      throw new CanaryError(
-        "infrastructure",
-        "docker",
-        "Baseline and candidate lanes executed different package-manager versions."
-      );
-    }
     const lockfileResult = await docker.run({
       workspace: candidateProject,
       cacheDirectory: candidateCache,
       command: candidateManager.lockfileCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds("candidate lockfile generation"),
       network: "bridge",
       phase: "candidate-lockfile",
-      corepackReadOnly: true,
-      extraEnvironment: managerLockfileEnvironment(candidateManager)
+      managerProvision,
+      extraEnvironment: managerLockfileEnvironment(candidateManager),
+      budget
     });
     appendDiagnostic(state, "candidate lockfile", lockfileResult);
-    if (lockfileResult.timedOut) {
-      state.infrastructureReason = `Candidate lockfile generation exceeded ${timeoutSeconds} seconds.`;
-      throw new CanaryError(
-        "infrastructure",
-        "timeout",
-        state.infrastructureReason,
-        { diagnostic: lockfileResult.output }
-      );
-    }
-    if (lockfileResult.exitCode !== 0) {
-      state.candidate = testPhase(lockfileResult, void 0);
-      const classification2 = classifyCompatibility(
-        state.baseline.status === "pass",
-        false
-      );
+    if (lockfileResult.timedOut || lockfileResult.exitCode !== 0) {
+      const disposition = candidateLockfileFailureDisposition(lockfileResult);
+      state.infrastructureReason = disposition.reason;
       return buildResult(
         consumer,
         artifact,
         runtime,
         state,
-        classification2,
-        state.baseline.status === "pass" ? "candidate-install" : "baseline-test",
+        disposition.classification,
+        disposition.failurePhase,
         Math.round(performance.now() - started)
       );
     }
@@ -10322,20 +10766,29 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
       );
     }
     await cleanNodeModules(candidateProject);
-    const candidateInstall = await docker.run({
-      workspace: candidateProject,
-      cacheDirectory: candidateCache,
-      command: candidateManager.immutableInstallCommand,
-      timeoutSeconds,
-      network: "bridge",
-      phase: "candidate-install",
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(candidateManager)
-    });
+    let candidateInstall;
+    try {
+      candidateInstall = await docker.run({
+        workspace: candidateProject,
+        cacheDirectory: candidateCache,
+        command: candidateManager.immutableInstallCommand,
+        timeoutSeconds: budget.timeoutSeconds("candidate dependency installation"),
+        network: "bridge",
+        phase: "candidate-install",
+        managerProvision,
+        extraEnvironment: managerEnvironment(candidateManager),
+        budget
+      });
+    } catch (error) {
+      if (error instanceof CanaryError && error.phase === "docker") {
+        state.candidateInstallFailureAttribution = "docker";
+      }
+      throw error;
+    }
     appendDiagnostic(state, "candidate install", candidateInstall);
     if (candidateInstall.timedOut) {
       state.candidate = testPhase(candidateInstall, void 0);
-      state.infrastructureReason = `Candidate installation exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = "Candidate installation exceeded its command or consumer budget.";
       return buildResult(
         consumer,
         artifact,
@@ -10348,13 +10801,52 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
     }
     if (candidateInstall.exitCode !== 0) {
       state.candidate = testPhase(candidateInstall, void 0);
+      await cleanNodeModules(candidateProject);
+      let attributionInstall;
+      try {
+        attributionInstall = await docker.run({
+          workspace: candidateProject,
+          cacheDirectory: candidateCache,
+          command: candidateManager.immutableInstallCommand,
+          timeoutSeconds: budget.timeoutSeconds("candidate install attribution"),
+          network: "bridge",
+          phase: "candidate-install-attribution",
+          managerProvision,
+          extraEnvironment: managerLockfileEnvironment(candidateManager),
+          budget
+        });
+      } catch (error) {
+        if (error instanceof CanaryError && error.phase === "docker") {
+          state.candidateInstallFailureAttribution = "docker";
+        }
+        throw error;
+      }
+      appendDiagnostic(
+        state,
+        "candidate install scripts-disabled attribution",
+        attributionInstall
+      );
+      const disposition = attributeCandidateInstallFailure(
+        candidateManager.name,
+        candidateInstall,
+        attributionInstall
+      );
+      state.candidateInstallFailureAttribution = disposition.attribution;
+      state.candidate = {
+        ...state.candidate,
+        durationMs: state.candidate.durationMs + attributionInstall.durationMs
+      };
+      const classification2 = state.baseline.status === "pass" ? disposition.classification : "tool-error";
+      if (classification2 === "tool-error") {
+        state.infrastructureReason = state.baseline.status === "pass" ? disposition.reason : "Candidate installation failed before a candidate test while the baseline test was already failing.";
+      }
       return buildResult(
         consumer,
         artifact,
         runtime,
         state,
-        classifyCompatibility(state.baseline.status === "pass", false),
-        state.baseline.status === "pass" ? "candidate-install" : "baseline-test",
+        classification2,
+        "candidate-install",
         Math.round(performance.now() - started)
       );
     }
@@ -10369,42 +10861,28 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
       workspace: candidateProject,
       cacheDirectory: candidateCache,
       command: manager.testCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds("candidate test"),
       network: "none",
       phase: "candidate-test",
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(candidateManager)
+      managerProvision,
+      extraEnvironment: managerEnvironment(candidateManager),
+      budget
     });
     appendDiagnostic(state, "candidate test", candidateTest);
     state.candidate = testPhase(candidateInstall, candidateTest);
     if (candidateTest.timedOut) {
-      state.infrastructureReason = `Candidate test exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = "Candidate test exceeded its command or consumer budget.";
     }
     const candidateAfter = await snapshotTree(candidateProject);
-    const finalDifference = diffSnapshots(candidateOriginal, candidateAfter);
-    const unexpectedFinalChanges = [
-      ...finalDifference.added,
-      ...finalDifference.removed,
-      ...finalDifference.changed.filter(
-        (path) => path !== "package.json" && path !== candidateManager.lockfile
-      )
-    ];
-    if (unexpectedFinalChanges.length > 0) {
-      throw new CanaryError(
-        "unsupported-project",
-        "candidate-test",
-        `Candidate install or test modified original files outside the planned manifest and lockfile: ${unexpectedFinalChanges.join(", ")}.`
-      );
-    }
-    for (const protectedPath of ["package.json", candidateManager.lockfile]) {
-      if (candidateAfter.get(protectedPath) !== afterLock.get(protectedPath)) {
-        throw new CanaryError(
-          "unsupported-project",
-          "candidate-test",
-          `Candidate install or test modified protected file ${protectedPath}.`
-        );
-      }
-    }
+    state.candidateGeneratedPaths = await validateLaneOutputs({
+      root: candidateProject,
+      originalTracked: candidateOriginal,
+      after: candidateAfter,
+      protectedExpected: afterLock,
+      protectedPaths,
+      phase: "candidate-test",
+      lane: "Candidate"
+    });
     if (candidateTest.timedOut) {
       return buildResult(
         consumer,
@@ -10454,40 +10932,49 @@ async function runConsumer(consumer, artifact, docker, runtime, timeoutSeconds) 
 import { lstat as lstat8, mkdir as mkdir6, writeFile as writeFile3 } from "node:fs/promises";
 import { join as join10 } from "node:path";
 
-// src/util/stable-json.ts
-function normalize2(value, seen) {
-  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => normalize2(item, seen));
-  }
-  if (typeof value === "object") {
-    if (seen.has(value)) throw new TypeError("Cannot serialize a circular value");
-    seen.add(value);
-    const record = value;
-    const normalized = /* @__PURE__ */ Object.create(null);
-    for (const key of Object.keys(record).sort()) {
-      const item = record[key];
-      if (item !== void 0) normalized[key] = normalize2(item, seen);
+// src/policy.ts
+function resolvePolicy(results, context) {
+  const config = context?.config;
+  return {
+    version: 1,
+    source: config?.executionMode ?? "library",
+    candidate: {
+      workingDirectory: config?.candidate.workingDirectory ?? ".",
+      packageManager: context?.candidateManager.name ?? null,
+      packageManagerVersion: context?.candidateManager.requestedVersion ?? null,
+      buildCommand: context?.candidateBuildCommand ?? null
+    },
+    consumers: results.map((result) => ({
+      repositoryUrl: result.repositoryUrl,
+      commit: result.commit,
+      packageManager: result.packageManager,
+      packageManagerVersion: result.requestedPackageManagerVersion,
+      testCommand: result.executedTestCommand
+    })),
+    limits: {
+      commandTimeoutSeconds: config?.timeoutSeconds ?? 0,
+      wholeRunTimeoutSeconds: config?.runTimeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS,
+      generatedFileCountPerLane: MAX_GENERATED_FILES_PER_LANE,
+      generatedBytesPerLane: MAX_GENERATED_BYTES_PER_LANE
     }
-    seen.delete(value);
-    return normalized;
-  }
-  throw new TypeError(`Unsupported JSON value: ${typeof value}`);
+  };
 }
-function stableStringify(value, spacing = 2) {
-  return `${JSON.stringify(normalize2(value, /* @__PURE__ */ new Set()), null, spacing)}
-`;
+function policySha256(policy) {
+  return sha256(stableStringify(policy));
 }
 
 // src/report.ts
-function createReport(artifact, dockerImage, results, generatedAt = (/* @__PURE__ */ new Date()).toISOString()) {
+function createReport(artifact, dockerImage, results, generatedAt = (/* @__PURE__ */ new Date()).toISOString(), policyContext) {
   const count = (classification) => results.filter((result) => result.classification === classification).length;
+  const resolvedPolicy = resolvePolicy(results, policyContext);
   return {
     schemaVersion: REPORT_SCHEMA_VERSION,
     tool: { name: PACKAGE_NAME, version: VERSION },
     generatedAt,
+    policy: {
+      sha256: policySha256(resolvedPolicy),
+      resolved: resolvedPolicy
+    },
     candidate: {
       packageName: artifact.packageName,
       packageVersion: artifact.packageVersion,
@@ -10547,6 +11034,8 @@ function markdownReport(report) {
     `Candidate: \`${report.candidate.packageName}@${report.candidate.packageVersion}\``,
     "",
     `Tarball SHA-256: \`${report.candidate.tarballSha256}\``,
+    "",
+    `Resolved policy SHA-256: \`${report.policy.sha256}\``,
     "",
     "| Consumer | Commit | Manager | Baseline | Candidate | Classification | Failure phase |",
     "| --- | --- | --- | --- | --- | --- | --- |",
@@ -10617,7 +11106,95 @@ async function writeReports(report, outputDirectory) {
   return { json, markdown };
 }
 
+// src/budget.ts
+var RunBudget = class _RunBudget {
+  #commandTimeoutSeconds;
+  #deadlineMs;
+  #clock;
+  #label;
+  constructor(commandTimeoutSeconds, wholeRunTimeoutSeconds, label = "whole run", clock = () => performance.now(), parentDeadlineMs) {
+    this.#commandTimeoutSeconds = commandTimeoutSeconds;
+    this.#clock = clock;
+    this.#label = label;
+    const ownDeadline = clock() + wholeRunTimeoutSeconds * 1e3;
+    this.#deadlineMs = Math.min(ownDeadline, parentDeadlineMs ?? ownDeadline);
+  }
+  remainingMilliseconds() {
+    return Math.max(0, this.#deadlineMs - this.#clock());
+  }
+  timeoutMilliseconds(phase, requestedMs) {
+    const remaining = this.remainingMilliseconds();
+    if (remaining < 1) {
+      throw new CanaryError(
+        "infrastructure",
+        "timeout",
+        `${this.#label} deadline was exhausted before ${phase}.`
+      );
+    }
+    return Math.max(
+      1,
+      Math.floor(
+        Math.min(
+          remaining,
+          requestedMs ?? this.#commandTimeoutSeconds * 1e3
+        )
+      )
+    );
+  }
+  timeoutSeconds(phase) {
+    return Math.max(1, Math.ceil(this.timeoutMilliseconds(phase) / 1e3));
+  }
+  forRemainingConsumer(consumer, remainingConsumerCount) {
+    if (!Number.isInteger(remainingConsumerCount) || remainingConsumerCount < 1) {
+      throw new Error("Remaining consumer count must be a positive integer.");
+    }
+    const allocationMs = Math.floor(
+      this.remainingMilliseconds() / remainingConsumerCount
+    );
+    if (allocationMs < 1) {
+      this.timeoutMilliseconds(`consumer ${consumer}`);
+    }
+    return new _RunBudget(
+      this.#commandTimeoutSeconds,
+      Math.max(1, allocationMs) / 1e3,
+      `Consumer ${consumer}`,
+      this.#clock,
+      this.#deadlineMs
+    );
+  }
+};
+
 // src/engine.ts
+import process4 from "node:process";
+function installTerminationCleanup(cleanup) {
+  let handling = false;
+  const handlers = /* @__PURE__ */ new Map();
+  const remove = () => {
+    for (const [signal, handler] of handlers) process4.off(signal, handler);
+  };
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const handler = () => {
+      if (handling) return;
+      handling = true;
+      void cleanup().then(() => {
+        remove();
+        process4.kill(process4.pid, signal);
+      }).catch((error) => {
+        remove();
+        process4.stderr.write(
+          `downstream-canary cleanup failure: ${diagnosticExcerpt(
+            error instanceof Error ? error.message : String(error)
+          )}
+`
+        );
+        process4.exit(2);
+      });
+    };
+    handlers.set(signal, handler);
+    process4.once(signal, handler);
+  }
+  return remove;
+}
 async function runCanary(config) {
   if (config.consumers.length < 1 || config.consumers.length > MAX_CONSUMERS) {
     throw new CanaryError(
@@ -10633,38 +11210,74 @@ async function runCanary(config) {
       `Timeout must be an integer from ${MIN_TIMEOUT_SECONDS} to ${MAX_TIMEOUT_SECONDS} seconds.`
     );
   }
+  const runTimeoutSeconds = config.runTimeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS;
+  if (!Number.isInteger(runTimeoutSeconds) || runTimeoutSeconds < MIN_RUN_TIMEOUT_SECONDS || runTimeoutSeconds > MAX_RUN_TIMEOUT_SECONDS) {
+    throw new CanaryError(
+      "configuration",
+      "configuration",
+      `Whole-run timeout must be an integer from ${MIN_RUN_TIMEOUT_SECONDS} to ${MAX_RUN_TIMEOUT_SECONDS} seconds.`
+    );
+  }
+  const budget = new RunBudget(
+    config.timeoutSeconds,
+    runTimeoutSeconds
+  );
   const temporaryRoot = await mkdtemp4(join11(tmpdir4(), "downstream-canary-run-"));
-  const docker = new DockerRunner(config.dockerExecutable, config.dockerImage);
+  const actionMode = config.executionMode === "github-action";
+  const docker = new DockerRunner(config.dockerExecutable, config.dockerImage, {
+    allowContextDiscovery: !actionMode,
+    requireLocalDocker: actionMode,
+    budget
+  });
+  const cleanup = async () => {
+    await docker.dispose();
+    await rm3(temporaryRoot, { recursive: true, force: true });
+  };
+  const removeSignalHandlers = installTerminationCleanup(cleanup);
   try {
     await docker.ensureReady();
     const built = await buildCandidate(
       config.candidate,
       docker,
       temporaryRoot,
-      config.timeoutSeconds
+      budget
     );
     const runtime = await docker.runtimeInfo(
       join11(temporaryRoot, "candidate-source", config.candidate.workingDirectory),
-      config.timeoutSeconds
+      budget.timeoutSeconds("runner identity inspection")
     );
     const results = [];
-    for (const consumer of config.consumers) {
+    for (const [index, consumer] of config.consumers.entries()) {
+      const consumerBudget = budget.forRemainingConsumer(
+        `${consumer.repositoryUrl}@${consumer.commit}`,
+        config.consumers.length - index
+      );
       results.push(
         await runConsumer(
           consumer,
           built.artifact,
           docker,
           runtime,
-          config.timeoutSeconds
+          consumerBudget
         )
       );
     }
-    const report = createReport(built.artifact, config.dockerImage, results);
+    const report = createReport(
+      built.artifact,
+      config.dockerImage,
+      results,
+      void 0,
+      {
+        config,
+        candidateManager: built.manager,
+        candidateBuildCommand: built.buildCommand
+      }
+    );
     const paths = await writeReports(report, config.outputDirectory);
     return { report, paths };
   } finally {
-    await docker.dispose();
-    await rm3(temporaryRoot, { recursive: true, force: true });
+    removeSignalHandlers();
+    await cleanup();
   }
 }
 
@@ -10680,19 +11293,15 @@ async function runCandidateTests(candidateRoot, fixtureRoot, dockerExecutable) {
   const cacheDirectory = join12(fixtureRoot, "demo-candidate-test-cache");
   try {
     await runner.ensureReady();
-    const warm = await runner.run({
-      workspace: candidateRoot,
-      cacheDirectory,
-      command: [
-        "corepack",
-        `npm@${DEFAULT_PACKAGE_MANAGER_VERSIONS.npm}`,
-        "--version"
-      ],
-      timeoutSeconds: 180,
-      network: "bridge",
-      phase: "demo-candidate-manager"
-    });
-    if (warm.exitCode !== 0) throw new Error(warm.output);
+    const managerProvision = await runner.provisionManager(
+      candidateRoot,
+      join12(fixtureRoot, "demo-candidate-manager-provision"),
+      {
+        name: "npm",
+        requestedVersion: DEFAULT_PACKAGE_MANAGER_VERSIONS.npm
+      },
+      180
+    );
     const test = await runner.run({
       workspace: candidateRoot,
       cacheDirectory,
@@ -10704,18 +11313,18 @@ async function runCandidateTests(candidateRoot, fixtureRoot, dockerExecutable) {
       timeoutSeconds: 180,
       network: "none",
       phase: "demo-candidate-test",
-      corepackReadOnly: true
+      managerProvision
     });
     if (test.exitCode !== 0) throw new Error(test.output);
-    process4.stdout.write("1. Candidate library tests: pass\n");
+    process5.stdout.write("1. Candidate library tests: pass\n");
   } finally {
     await runner.dispose();
   }
 }
 async function main() {
-  const mode = parseMode(process4.argv[2]);
-  const dockerExecutable = process4.env.DOWNSTREAM_CANARY_DOCKER ?? "docker";
-  process4.stdout.write(`Downstream Canary self-contained ${mode} demo
+  const mode = parseMode(process5.argv[2]);
+  const dockerExecutable = process5.env.DOWNSTREAM_CANARY_DOCKER ?? "docker";
+  process5.stdout.write(`Downstream Canary self-contained ${mode} demo
 
 `);
   const world = await createFixtureWorld(dockerExecutable);
@@ -10734,28 +11343,28 @@ async function main() {
   });
   const result = run.report.results[0];
   if (!result) throw new Error("Demo produced no result.");
-  process4.stdout.write(`2. Baseline downstream tests: ${result.baseline.status}
+  process5.stdout.write(`2. Baseline downstream tests: ${result.baseline.status}
 `);
-  process4.stdout.write(`3. Candidate downstream tests: ${result.candidate.status}
+  process5.stdout.write(`3. Candidate downstream tests: ${result.candidate.status}
 `);
-  process4.stdout.write(`4. Classification: ${result.classification}
+  process5.stdout.write(`4. Classification: ${result.classification}
 `);
-  process4.stdout.write(`5. Exit code: ${run.report.summary.exitCode}
+  process5.stdout.write(`5. Exit code: ${run.report.summary.exitCode}
 
 `);
-  process4.stdout.write(`${terminalTable(run.report)}
+  process5.stdout.write(`${terminalTable(run.report)}
 
 `);
-  process4.stdout.write(`JSON report: ${run.paths.json}
+  process5.stdout.write(`JSON report: ${run.paths.json}
 `);
-  process4.stdout.write(`Markdown report: ${run.paths.markdown}
+  process5.stdout.write(`Markdown report: ${run.paths.markdown}
 `);
   return run.report.summary.exitCode;
 }
 try {
-  process4.exitCode = await main();
+  process5.exitCode = await main();
 } catch (error) {
-  process4.stderr.write(`${error instanceof Error ? error.message : String(error)}
+  process5.stderr.write(`${error instanceof Error ? error.message : String(error)}
 `);
-  process4.exitCode = 2;
+  process5.exitCode = 2;
 }

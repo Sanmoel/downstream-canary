@@ -48,19 +48,22 @@ on:
 jobs:
   downstream-canary:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: Sanmoel/downstream-canary@10847752729822bda2f4d13ec78ed3688f60a00b
+      - uses: Sanmoel/downstream-canary@70d8fab1341fc9afe4c518fa54602e5551008844
         with:
           consumers: |
             acme/example-client@0123456789abcdef0123456789abcdef01234567
             acme/example-tool@abcdef0123456789abcdef0123456789abcdef01
 ```
 
-Do not replace the full SHAs with branches or tags. The Action needs Docker (available on GitHub-hosted Ubuntu), no secrets, and only `contents: read`. It produces a terminal table, GitHub Step Summary, stable versioned JSON, bounded redacted diagnostics, `report-path`, and `regression-count` outputs.
+This example pins the reviewed v0.1.0 implementation commit. Keep the full commit SHA rather than replacing it with a branch or mutable tag. The Action fails closed unless it is running in GitHub Actions on a GitHub-hosted Linux runner, rejects `pull_request_target`, and accepts only an unset or local Unix-socket `DOCKER_HOST`. It needs no secrets and only `contents: read`.
+
+Action mode never reads `.downstream-canary.yml`. The Action invocation selects consumers, overrides, output location, and resource limits; conventional package-manager and test-script detection is restricted to the selected root package manifests and lockfiles. The resolved policy, its canonical SHA-256, and each exact test argument array are recorded in the report. The local CLI has a separate, explicit `--local --candidate-root <path>` boundary and may use YAML.
 
 ## Deterministic result
 
@@ -71,7 +74,7 @@ Do not replace the full SHAs with branches or tags. The Action needs Docker (ava
 | fail | fail | `inconclusive-preexisting` | No |
 | fail | pass | `candidate-improvement` | No |
 
-Exit `0` means no candidate regression, `1` means at least one candidate regression, and `2` means configuration, unsupported-project, tooling, or infrastructure error. Baseline installation failure is always exit `2`; candidate install failure after a healthy baseline is a candidate regression with phase `candidate-install`.
+Exit `0` means no candidate regression, `1` means at least one candidate regression, and `2` means configuration, unsupported-project, tooling, or infrastructure error. Baseline installation failure and every candidate lockfile-generation failure are exit `2`. A candidate installation failure blocks only when a scripts-disabled attribution run positively proves a package-manager dependency-resolution or lifecycle incompatibility; registry, network, Corepack, Docker, timeout, and unknown causes are tool errors.
 
 No statistical or AI decision changes this result. The same command runs in both test lanes. The only compatibility blocker is `candidate-regression`.
 
@@ -83,7 +86,8 @@ No statistical or AI decision changes this result. The same command runs in both
 4. Frozen-install and test the lockfile baseline.
 5. Copy the tarball into the candidate checkout, patch one direct dependency field to a relative `file:` URL, and generate a lockfile with lifecycle scripts disabled.
 6. Verify the manifest/lockfile change boundary, perform a fresh frozen install, and compare installed package bytes with the tarball.
-7. Test with `--network none`, classify the two results, and clean every temporary lane.
+7. Run the exact same recorded test arguments with `--network none`, preserve all tracked/protected files, and record bounded ordinary generated output.
+8. Classify deterministically, verify removal of every run-labeled container, and perform a final label sweep.
 
 The implementation provides **hardened container isolation for explicitly selected and pinned downstream projects**. Docker is not a complete security boundary. Installation retains network access because public dependencies must be downloaded; see [the threat model](docs/threat-model.md).
 
@@ -102,7 +106,7 @@ The exact end-to-end-tested matrix is Node 24.19.0, npm 11.17.0, pnpm 11.21.0, a
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
-The repository includes a committed bundled runtime in `dist/`, verified against the TypeScript source in CI. The package/CLI is named `downstream-canary`, but no public npm-package availability is claimed.
+The repository includes a committed bundled runtime in `dist/`, verified against the TypeScript source in CI, and generated [third-party notices](THIRD_PARTY_NOTICES) for its bundled libraries. The package/CLI is named `downstream-canary`, but no public npm-package availability is claimed. The prepared release steps are in [the v0.1.0 checklist](docs/release-checklist.md).
 
 ## Local validation
 

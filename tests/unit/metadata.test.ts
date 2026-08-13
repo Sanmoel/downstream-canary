@@ -5,6 +5,7 @@ import { parse } from 'yaml';
 interface ActionMetadata {
   readonly runs?: { readonly using?: string; readonly main?: string };
   readonly outputs?: Record<string, unknown>;
+  readonly inputs?: Record<string, { readonly required?: boolean }>;
 }
 
 interface WorkflowStep {
@@ -14,7 +15,11 @@ interface WorkflowStep {
 interface Workflow {
   readonly permissions?: Record<string, string>;
   readonly on?: Record<string, unknown>;
-  readonly jobs?: Record<string, { readonly 'runs-on'?: string; readonly steps?: WorkflowStep[] }>;
+  readonly jobs?: Record<string, {
+    readonly 'runs-on'?: string;
+    readonly 'timeout-minutes'?: number;
+    readonly steps?: WorkflowStep[];
+  }>;
 }
 
 describe('GitHub metadata', () => {
@@ -23,6 +28,8 @@ describe('GitHub metadata', () => {
     expect(action.runs).toEqual({ using: 'node24', main: 'dist/action.js' });
     expect(action.outputs).toHaveProperty('report-path');
     expect(action.outputs).toHaveProperty('regression-count');
+    expect(action.inputs).not.toHaveProperty('config');
+    expect(action.inputs?.consumers?.required).toBe(true);
   });
 
   it('uses the safe event, least privilege, Ubuntu, and commit-pinned actions', async () => {
@@ -33,10 +40,21 @@ describe('GitHub metadata', () => {
 
     for (const job of Object.values(workflow.jobs ?? {})) {
       expect(job['runs-on']).toBe('ubuntu-latest');
+      expect(job['timeout-minutes']).toBeGreaterThan(0);
       for (const step of job.steps ?? []) {
         if (!step.uses || step.uses.startsWith('./')) continue;
         expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/);
       }
     }
+  });
+
+  it('distributes exact notices for bundled runtime dependencies', async () => {
+    const manifest = JSON.parse(await readFile('package.json', 'utf8')) as {
+      readonly files?: readonly string[];
+    };
+    const notices = await readFile('THIRD_PARTY_NOTICES', 'utf8');
+    expect(manifest.files).toContain('THIRD_PARTY_NOTICES');
+    expect(notices).toContain('jsonc-parser 3.3.1');
+    expect(notices).toContain('yaml 2.9.0');
   });
 });

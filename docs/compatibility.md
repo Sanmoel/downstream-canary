@@ -13,7 +13,7 @@ Downstream Canary v0.1 targets small, single-package JavaScript libraries and ex
 
 Each manager passed compatible and candidate-regression end-to-end fixtures through candidate packing, direct dependency injection, lockfile generation, fresh installation, installed-byte verification, and identical tests. This is a claim about those exact versions and modes, not every release in their major lines.
 
-Detection order is explicit input, exact `packageManager`, exactly one recognized lockfile, then the v0.1-pinned default shown above. A declaration and lockfile disagreement, multiple recognized lockfiles, non-exact declared version, or other ambiguity is an exit-code-2 configuration error.
+Detection order is explicit input, exact `packageManager`, exactly one recognized lockfile, then the v0.1-pinned default shown above. A declaration and lockfile disagreement, multiple recognized lockfiles, non-exact declared version, or other ambiguity is an exit-code-2 configuration error. v0.1 rejects `packageManager` integrity suffixes rather than silently discarding an unverified hash, and rejects every project `.corepack.env` while forcing `COREPACK_ENV_FILE=0`.
 
 ## Supported project shape
 
@@ -25,6 +25,7 @@ Detection order is explicit input, exact `packageManager`, exactly one recognize
 - Root test script, or an explicit test command argument array.
 - Candidate root build script when present, or an explicit build command argument array.
 - Public npm registry packages; non-registry and credential-bearing lockfile URLs are rejected.
+- Bounded ordinary test output: at most 2,000 newly generated regular files and 100 MiB per lane; tracked and package-manager protected files remain immutable after their planned phase.
 
 ## Explicitly unsupported
 
@@ -34,5 +35,6 @@ Detection order is explicit input, exact `packageManager`, exactly one recognize
 - Yarn Plug'n'Play, Zero-Install/local-cache layouts, custom Yarn binaries/plugins, Classic Yarn, or other Yarn linker modes.
 - Self-hosted runners, Windows, and macOS.
 - User-level npm, pnpm, Yarn, Git, or SSH credential configuration, plus project-level registry credentials or proxy settings.
+- Custom install and lockfile commands, Corepack integrity-suffixed declarations, and project `.corepack.env` files.
 
 An explicitly selected consumer may still have requirements outside this contract. Those are reported as unsupported-project or infrastructure errors, never silently converted into candidate regressions.

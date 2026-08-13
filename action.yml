@@ -4,10 +4,7 @@ author: Sanmoel
 inputs:
   consumers:
     description: Newline-separated OWNER/REPOSITORY@FULL_COMMIT_SHA entries.
-    required: false
-  config:
-    description: Optional path to .downstream-canary.yml for nonstandard projects.
-    required: false
+    required: true
   candidate-root:
     description: Candidate repository root relative to the checked-out workspace.
     required: false
@@ -20,6 +17,10 @@ inputs:
     description: Wall-clock timeout applied to each external command.
     required: false
     default: '600'
+  run-timeout-seconds:
+    description: Monotonic wall-clock budget for candidate build and all consumers.
+    required: false
+    default: '2700'
   candidate-package-manager:
     description: Optional candidate package-manager override (npm, pnpm, or yarn).
     required: false

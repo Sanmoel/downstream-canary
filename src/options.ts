@@ -28,7 +28,7 @@ export function parseArguments(arguments_: readonly string[]): ParsedArguments {
       continue;
     }
     const name = argument.slice(2);
-    if (name === 'help' || name === 'version') {
+    if (name === 'help' || name === 'version' || name === 'local') {
       if (flags.has(name) || values.has(name)) {
         throw new CanaryError('configuration', 'configuration', `Duplicate option --${name}.`);
       }

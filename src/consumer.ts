@@ -9,7 +9,6 @@ import { asCanaryError, CanaryError } from './errors.js';
 import { verifyInstalledCandidate } from './installed.js';
 import {
   detectPackageManager,
-  managerVersionCommand,
   managerEnvironment,
   managerLockfileEnvironment,
   readManifest,
@@ -20,13 +19,24 @@ import type {
   ConsumerSpec,
   DependencyField,
   FailurePhase,
+  GeneratedPath,
   PackageManagerDetection,
   PhaseResult,
   ProcessResult,
 } from './types.js';
-import { diffSnapshots, snapshotTree } from './util/files.js';
+import {
+  diffSnapshots,
+  snapshotTree,
+  validateLaneOutputs,
+} from './util/files.js';
 import { sha256File } from './util/hash.js';
 import { diagnosticExcerpt } from './util/logs.js';
+import {
+  attributeCandidateInstallFailure,
+  candidateLockfileFailureDisposition,
+} from './failure-attribution.js';
+import type { CandidateInstallFailureAttribution } from './types.js';
+import type { RunBudget } from './budget.js';
 
 interface MutableRunState {
   manager: PackageManagerDetection | null;
@@ -37,6 +47,11 @@ interface MutableRunState {
   dependencyFieldReplaced: DependencyField | null;
   diagnostic: string;
   infrastructureReason: string | null;
+  testCommand: PackageManagerDetection['testCommand'] | null;
+  candidateInstallFailureAttribution: CandidateInstallFailureAttribution | null;
+  managerProvisionSha256: string | null;
+  baselineGeneratedPaths: readonly GeneratedPath[];
+  candidateGeneratedPaths: readonly GeneratedPath[];
 }
 
 const NOT_RUN: PhaseResult = {
@@ -142,40 +157,6 @@ function requireNoUnexpectedChanges(
   }
 }
 
-async function actualManagerVersion(
-  docker: DockerRunner,
-  manager: PackageManagerDetection,
-  workspace: string,
-  cacheDirectory: string,
-  timeoutSeconds: number,
-): Promise<string> {
-  const result = await docker.run({
-    workspace,
-    cacheDirectory,
-    command: managerVersionCommand(manager),
-    timeoutSeconds,
-    network: 'bridge',
-    phase: `${manager.name}-version`,
-  });
-  if (result.timedOut || result.exitCode !== 0) {
-    throw new CanaryError(
-      'infrastructure',
-      result.timedOut ? 'timeout' : 'docker',
-      `Unable to run ${manager.name}@${manager.requestedVersion}.`,
-      { diagnostic: result.output },
-    );
-  }
-  const actual = result.stdout.trim();
-  if (actual !== manager.requestedVersion) {
-    throw new CanaryError(
-      'tooling',
-      'configuration',
-      `Requested ${manager.name}@${manager.requestedVersion}, but ${actual} executed.`,
-    );
-  }
-  return actual;
-}
-
 function testPhase(
   install: ProcessResult,
   test: ProcessResult | undefined,
@@ -213,6 +194,7 @@ function buildResult(
     packageManager: state.manager?.name ?? null,
     declaredPackageManagerVersion: state.manager?.declaredVersion ?? null,
     actualPackageManagerVersion: state.manager?.actualVersion ?? null,
+    requestedPackageManagerVersion: state.manager?.requestedVersion ?? null,
     nodeVersion: runtime.nodeVersion,
     operatingSystem: runtime.operatingSystem,
     architecture: runtime.architecture,
@@ -229,6 +211,14 @@ function buildResult(
     dependencyFieldReplaced: state.dependencyFieldReplaced,
     timeoutOrInfrastructureReason: state.infrastructureReason,
     diagnosticExcerpt: diagnosticExcerpt(state.diagnostic),
+    executedTestCommand: state.testCommand,
+    candidateInstallFailureAttribution:
+      state.candidateInstallFailureAttribution,
+    packageManagerProvisionSha256: state.managerProvisionSha256,
+    generatedPaths: {
+      baseline: state.baselineGeneratedPaths,
+      candidate: state.candidateGeneratedPaths,
+    },
   };
 }
 
@@ -250,7 +240,7 @@ export async function runConsumer(
   artifact: CandidateArtifact,
   docker: DockerRunner,
   runtime: ContainerRuntimeInfo,
-  timeoutSeconds: number,
+  budget: RunBudget,
 ): Promise<ConsumerResult> {
   const started = performance.now();
   const root = await mkdtemp(join(tmpdir(), 'downstream-canary-consumer-'));
@@ -263,6 +253,11 @@ export async function runConsumer(
     dependencyFieldReplaced: null,
     diagnostic: '',
     infrastructureReason: null,
+    testCommand: null,
+    candidateInstallFailureAttribution: null,
+    managerProvisionSha256: null,
+    baselineGeneratedPaths: [],
+    candidateGeneratedPaths: [],
   };
 
   try {
@@ -272,13 +267,13 @@ export async function runConsumer(
       consumer,
       baselineCheckout,
       join(root, 'git-config-baseline'),
-      timeoutSeconds,
+      budget,
     );
     await checkoutConsumer(
       consumer,
       candidateCheckout,
       join(root, 'git-config-candidate'),
-      timeoutSeconds,
+      budget,
     );
     const baselineProject = await projectPath(
       baselineCheckout,
@@ -319,31 +314,34 @@ export async function runConsumer(
     }
     const originalLockPath = join(baselineProject, manager.lockfile);
     state.originalLockfileHash = await sha256File(originalLockPath);
-    const baselineCache = join(root, 'baseline-cache');
-    const actualVersion = await actualManagerVersion(
-      docker,
-      manager,
+    const managerProvision = await docker.provisionManager(
       baselineProject,
-      baselineCache,
-      timeoutSeconds,
+      join(root, 'manager-provision'),
+      manager,
+      budget.timeoutSeconds('consumer package-manager provisioning'),
+      budget,
     );
-    state.manager = { ...manager, actualVersion };
+    state.manager = { ...manager, actualVersion: managerProvision.version };
+    state.managerProvisionSha256 = managerProvision.sha256;
+    const baselineCache = join(root, 'baseline-cache');
+    state.testCommand = manager.testCommand;
 
     const baselineInstall = await docker.run({
       workspace: baselineProject,
       cacheDirectory: baselineCache,
       command: manager.immutableInstallCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds('baseline dependency installation'),
       network: 'bridge',
       phase: 'baseline-install',
-      corepackReadOnly: true,
+      managerProvision,
       extraEnvironment: managerEnvironment(manager),
+      budget,
     });
     appendDiagnostic(state, 'baseline install', baselineInstall);
     if (baselineInstall.timedOut || baselineInstall.exitCode !== 0) {
       state.baseline = testPhase(baselineInstall, undefined);
       state.infrastructureReason = baselineInstall.timedOut
-        ? `Baseline installation exceeded ${timeoutSeconds} seconds.`
+        ? 'Baseline installation exceeded its command or consumer budget.'
         : 'Baseline dependency installation failed, so the comparison is not trustworthy.';
       return buildResult(
         consumer,
@@ -360,25 +358,39 @@ export async function runConsumer(
       workspace: baselineProject,
       cacheDirectory: baselineCache,
       command: manager.testCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds('baseline test'),
       network: 'none',
       phase: 'baseline-test',
-      corepackReadOnly: true,
+      managerProvision,
       extraEnvironment: managerEnvironment(manager),
+      budget,
     });
     appendDiagnostic(state, 'baseline test', baselineTest);
     state.baseline = testPhase(baselineInstall, baselineTest);
     if (baselineTest.timedOut) {
-      state.infrastructureReason = `Baseline test exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = 'Baseline test exceeded its command or consumer budget.';
     }
+    const protectedPaths = new Set([
+      'package.json',
+      manager.lockfile,
+      '.npmrc',
+      '.yarnrc.yml',
+      '.corepack.env',
+      'pnpm-workspace.yaml',
+      'pnpm-workspace.yml',
+      '.pnp.cjs',
+      '.pnp.loader.mjs',
+    ]);
     const baselineAfter = await snapshotTree(baselineProject);
-    if (!snapshotsEqual(baselineOriginal, baselineAfter)) {
-      throw new CanaryError(
-        'unsupported-project',
-        'baseline-test',
-        'Baseline install or test added, removed, or modified project files; the baseline must remain byte-identical.',
-      );
-    }
+    state.baselineGeneratedPaths = await validateLaneOutputs({
+      root: baselineProject,
+      originalTracked: baselineOriginal,
+      after: baselineAfter,
+      protectedExpected: baselineOriginal,
+      protectedPaths,
+      phase: 'baseline-test',
+      lane: 'Baseline',
+    });
     if (baselineTest.timedOut) {
       return buildResult(
         consumer,
@@ -422,54 +434,28 @@ export async function runConsumer(
     );
 
     const candidateCache = join(root, 'candidate-cache');
-    const candidateActualVersion = await actualManagerVersion(
-      docker,
-      candidateManager,
-      candidateProject,
-      candidateCache,
-      timeoutSeconds,
-    );
-    if (candidateActualVersion !== actualVersion) {
-      throw new CanaryError(
-        'infrastructure',
-        'docker',
-        'Baseline and candidate lanes executed different package-manager versions.',
-      );
-    }
-
     const lockfileResult = await docker.run({
       workspace: candidateProject,
       cacheDirectory: candidateCache,
       command: candidateManager.lockfileCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds('candidate lockfile generation'),
       network: 'bridge',
       phase: 'candidate-lockfile',
-      corepackReadOnly: true,
+      managerProvision,
       extraEnvironment: managerLockfileEnvironment(candidateManager),
+      budget,
     });
     appendDiagnostic(state, 'candidate lockfile', lockfileResult);
-    if (lockfileResult.timedOut) {
-      state.infrastructureReason = `Candidate lockfile generation exceeded ${timeoutSeconds} seconds.`;
-      throw new CanaryError(
-        'infrastructure',
-        'timeout',
-        state.infrastructureReason,
-        { diagnostic: lockfileResult.output },
-      );
-    }
-    if (lockfileResult.exitCode !== 0) {
-      state.candidate = testPhase(lockfileResult, undefined);
-      const classification = classifyCompatibility(
-        state.baseline.status === 'pass',
-        false,
-      );
+    if (lockfileResult.timedOut || lockfileResult.exitCode !== 0) {
+      const disposition = candidateLockfileFailureDisposition(lockfileResult);
+      state.infrastructureReason = disposition.reason;
       return buildResult(
         consumer,
         artifact,
         runtime,
         state,
-        classification,
-        state.baseline.status === 'pass' ? 'candidate-install' : 'baseline-test',
+        disposition.classification,
+        disposition.failurePhase,
         Math.round(performance.now() - started),
       );
     }
@@ -517,20 +503,29 @@ export async function runConsumer(
     }
 
     await cleanNodeModules(candidateProject);
-    const candidateInstall = await docker.run({
-      workspace: candidateProject,
-      cacheDirectory: candidateCache,
-      command: candidateManager.immutableInstallCommand,
-      timeoutSeconds,
-      network: 'bridge',
-      phase: 'candidate-install',
-      corepackReadOnly: true,
-      extraEnvironment: managerEnvironment(candidateManager),
-    });
+    let candidateInstall: ProcessResult;
+    try {
+      candidateInstall = await docker.run({
+        workspace: candidateProject,
+        cacheDirectory: candidateCache,
+        command: candidateManager.immutableInstallCommand,
+        timeoutSeconds: budget.timeoutSeconds('candidate dependency installation'),
+        network: 'bridge',
+        phase: 'candidate-install',
+        managerProvision,
+        extraEnvironment: managerEnvironment(candidateManager),
+        budget,
+      });
+    } catch (error) {
+      if (error instanceof CanaryError && error.phase === 'docker') {
+        state.candidateInstallFailureAttribution = 'docker';
+      }
+      throw error;
+    }
     appendDiagnostic(state, 'candidate install', candidateInstall);
     if (candidateInstall.timedOut) {
       state.candidate = testPhase(candidateInstall, undefined);
-      state.infrastructureReason = `Candidate installation exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = 'Candidate installation exceeded its command or consumer budget.';
       return buildResult(
         consumer,
         artifact,
@@ -543,13 +538,59 @@ export async function runConsumer(
     }
     if (candidateInstall.exitCode !== 0) {
       state.candidate = testPhase(candidateInstall, undefined);
+      await cleanNodeModules(candidateProject);
+      let attributionInstall: ProcessResult;
+      try {
+        attributionInstall = await docker.run({
+          workspace: candidateProject,
+          cacheDirectory: candidateCache,
+          command: candidateManager.immutableInstallCommand,
+          timeoutSeconds: budget.timeoutSeconds('candidate install attribution'),
+          network: 'bridge',
+          phase: 'candidate-install-attribution',
+          managerProvision,
+          extraEnvironment: managerLockfileEnvironment(candidateManager),
+          budget,
+        });
+      } catch (error) {
+        if (error instanceof CanaryError && error.phase === 'docker') {
+          state.candidateInstallFailureAttribution = 'docker';
+        }
+        throw error;
+      }
+      appendDiagnostic(
+        state,
+        'candidate install scripts-disabled attribution',
+        attributionInstall,
+      );
+      const disposition = attributeCandidateInstallFailure(
+        candidateManager.name,
+        candidateInstall,
+        attributionInstall,
+      );
+      state.candidateInstallFailureAttribution = disposition.attribution;
+      state.candidate = {
+        ...state.candidate,
+        durationMs:
+          state.candidate.durationMs + attributionInstall.durationMs,
+      };
+      const classification =
+        state.baseline.status === 'pass'
+          ? disposition.classification
+          : 'tool-error';
+      if (classification === 'tool-error') {
+        state.infrastructureReason =
+          state.baseline.status === 'pass'
+            ? disposition.reason
+            : 'Candidate installation failed before a candidate test while the baseline test was already failing.';
+      }
       return buildResult(
         consumer,
         artifact,
         runtime,
         state,
-        classifyCompatibility(state.baseline.status === 'pass', false),
-        state.baseline.status === 'pass' ? 'candidate-install' : 'baseline-test',
+        classification,
+        'candidate-install',
         Math.round(performance.now() - started),
       );
     }
@@ -565,42 +606,28 @@ export async function runConsumer(
       workspace: candidateProject,
       cacheDirectory: candidateCache,
       command: manager.testCommand,
-      timeoutSeconds,
+      timeoutSeconds: budget.timeoutSeconds('candidate test'),
       network: 'none',
       phase: 'candidate-test',
-      corepackReadOnly: true,
+      managerProvision,
       extraEnvironment: managerEnvironment(candidateManager),
+      budget,
     });
     appendDiagnostic(state, 'candidate test', candidateTest);
     state.candidate = testPhase(candidateInstall, candidateTest);
     if (candidateTest.timedOut) {
-      state.infrastructureReason = `Candidate test exceeded ${timeoutSeconds} seconds.`;
+      state.infrastructureReason = 'Candidate test exceeded its command or consumer budget.';
     }
     const candidateAfter = await snapshotTree(candidateProject);
-    const finalDifference = diffSnapshots(candidateOriginal, candidateAfter);
-    const unexpectedFinalChanges = [
-      ...finalDifference.added,
-      ...finalDifference.removed,
-      ...finalDifference.changed.filter(
-        (path) => path !== 'package.json' && path !== candidateManager.lockfile,
-      ),
-    ];
-    if (unexpectedFinalChanges.length > 0) {
-      throw new CanaryError(
-        'unsupported-project',
-        'candidate-test',
-        `Candidate install or test modified original files outside the planned manifest and lockfile: ${unexpectedFinalChanges.join(', ')}.`,
-      );
-    }
-    for (const protectedPath of ['package.json', candidateManager.lockfile]) {
-      if (candidateAfter.get(protectedPath) !== afterLock.get(protectedPath)) {
-        throw new CanaryError(
-          'unsupported-project',
-          'candidate-test',
-          `Candidate install or test modified protected file ${protectedPath}.`,
-        );
-      }
-    }
+    state.candidateGeneratedPaths = await validateLaneOutputs({
+      root: candidateProject,
+      originalTracked: candidateOriginal,
+      after: candidateAfter,
+      protectedExpected: afterLock,
+      protectedPaths,
+      phase: 'candidate-test',
+      lane: 'Candidate',
+    });
     if (candidateTest.timedOut) {
       return buildResult(
         consumer,

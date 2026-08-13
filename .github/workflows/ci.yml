@@ -31,6 +31,7 @@ jobs:
       - run: npm run integration
       - run: npm run action:smoke
       - run: npm run check:dist
+      - run: npm run check:notices
       - name: GitHub Action metadata and bundled entry-point smoke
         id: action-smoke
         continue-on-error: true

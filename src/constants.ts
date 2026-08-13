@@ -15,14 +15,19 @@ export const DEFAULT_PACKAGE_MANAGER_VERSIONS = {
 } as const;
 
 export const DEFAULT_TIMEOUT_SECONDS = 10 * 60;
+export const DEFAULT_RUN_TIMEOUT_SECONDS = 45 * 60;
 export const MIN_TIMEOUT_SECONDS = 1;
 export const MAX_TIMEOUT_SECONDS = 60 * 60;
+export const MIN_RUN_TIMEOUT_SECONDS = 1;
+export const MAX_RUN_TIMEOUT_SECONDS = 6 * 60 * 60;
 export const MAX_CONSUMERS = 10;
 export const MAX_PROCESS_OUTPUT_BYTES = 64 * 1024;
 export const MAX_DIAGNOSTIC_BYTES = 8 * 1024;
 export const MAX_TARBALL_BYTES = 50 * 1024 * 1024;
 export const MAX_UNPACKED_TARBALL_BYTES = 200 * 1024 * 1024;
 export const MAX_TARBALL_ENTRIES = 20_000;
+export const MAX_GENERATED_FILES_PER_LANE = 2_000;
+export const MAX_GENERATED_BYTES_PER_LANE = 100 * 1024 * 1024;
 
 export const DOCKER_LIMITS = {
   cpus: '2',

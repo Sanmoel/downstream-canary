@@ -52,6 +52,7 @@ describe('published JSON Schemas', () => {
       packageManager: 'npm',
       declaredPackageManagerVersion: '11.17.0',
       actualPackageManagerVersion: '11.17.0',
+      requestedPackageManagerVersion: '11.17.0',
       nodeVersion: 'v24.19.0',
       operatingSystem: 'linux',
       architecture: 'x64',
@@ -68,6 +69,10 @@ describe('published JSON Schemas', () => {
       dependencyFieldReplaced: 'dependencies',
       timeoutOrInfrastructureReason: null,
       diagnosticExcerpt: '',
+      executedTestCommand: ['corepack', 'npm@11.17.0', 'test'],
+      candidateInstallFailureAttribution: null,
+      packageManagerProvisionSha256: 'e'.repeat(64),
+      generatedPaths: { baseline: [], candidate: [] },
     };
     const validateReport = ajv.compile(
       await schema('schemas/downstream-canary-report.schema.json'),

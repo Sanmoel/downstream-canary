@@ -4,7 +4,7 @@
   "title": "Downstream Canary report v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "tool", "generatedAt", "candidate", "environment", "results", "summary"],
+  "required": ["schemaVersion", "tool", "generatedAt", "policy", "candidate", "environment", "results", "summary"],
   "properties": {
     "schemaVersion": { "const": "1.0.0" },
     "tool": {
@@ -17,6 +17,15 @@
       }
     },
     "generatedAt": { "type": "string", "format": "date-time" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "resolved"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "resolved": { "$ref": "#/$defs/resolvedPolicy" }
+      }
+    },
     "candidate": {
       "type": "object",
       "additionalProperties": false,
@@ -74,13 +83,14 @@
     "result": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repositoryUrl", "commit", "packageManager", "declaredPackageManagerVersion", "actualPackageManagerVersion", "nodeVersion", "operatingSystem", "architecture", "baseline", "candidate", "classification", "failurePhase", "durationMs", "candidatePackageName", "candidatePackageVersion", "candidateTarballSha256", "originalLockfileHash", "candidateLockfileHash", "dependencyFieldReplaced", "timeoutOrInfrastructureReason", "diagnosticExcerpt"],
+      "required": ["repositoryUrl", "commit", "packageManager", "declaredPackageManagerVersion", "actualPackageManagerVersion", "requestedPackageManagerVersion", "nodeVersion", "operatingSystem", "architecture", "baseline", "candidate", "classification", "failurePhase", "durationMs", "candidatePackageName", "candidatePackageVersion", "candidateTarballSha256", "originalLockfileHash", "candidateLockfileHash", "dependencyFieldReplaced", "timeoutOrInfrastructureReason", "diagnosticExcerpt", "executedTestCommand", "candidateInstallFailureAttribution", "packageManagerProvisionSha256", "generatedPaths"],
       "properties": {
         "repositoryUrl": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
         "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "packageManager": { "oneOf": [{ "enum": ["npm", "pnpm", "yarn"] }, { "type": "null" }] },
         "declaredPackageManagerVersion": { "type": ["string", "null"] },
         "actualPackageManagerVersion": { "type": ["string", "null"] },
+        "requestedPackageManagerVersion": { "type": ["string", "null"] },
         "nodeVersion": { "type": "string" },
         "operatingSystem": { "const": "linux" },
         "architecture": { "type": "string" },
@@ -115,7 +125,94 @@
         "candidateLockfileHash": { "$ref": "#/$defs/nullableSha256" },
         "dependencyFieldReplaced": { "oneOf": [{ "enum": ["dependencies", "devDependencies", "optionalDependencies"] }, { "type": "null" }] },
         "timeoutOrInfrastructureReason": { "type": ["string", "null"] },
-        "diagnosticExcerpt": { "type": "string", "maxLength": 8192 }
+        "diagnosticExcerpt": { "type": "string", "maxLength": 8192 },
+        "executedTestCommand": { "$ref": "#/$defs/nullableCommand" },
+        "candidateInstallFailureAttribution": {
+          "oneOf": [
+            { "enum": ["dependency-resolution", "lifecycle-incompatibility", "registry", "network", "corepack", "docker", "unknown"] },
+            { "type": "null" }
+          ]
+        },
+        "packageManagerProvisionSha256": { "$ref": "#/$defs/nullableSha256" },
+        "generatedPaths": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseline", "candidate"],
+          "properties": {
+            "baseline": { "$ref": "#/$defs/generatedPaths" },
+            "candidate": { "$ref": "#/$defs/generatedPaths" }
+          }
+        }
+      }
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "nullableCommand": {
+      "oneOf": [{ "$ref": "#/$defs/command" }, { "type": "null" }]
+    },
+    "generatedPaths": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sizeBytes"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sizeBytes": { "type": "integer", "minimum": 0, "maximum": 104857600 }
+        }
+      }
+    },
+    "resolvedPolicyConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryUrl", "commit", "packageManager", "packageManagerVersion", "testCommand"],
+      "properties": {
+        "repositoryUrl": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "packageManager": { "oneOf": [{ "enum": ["npm", "pnpm", "yarn"] }, { "type": "null" }] },
+        "packageManagerVersion": { "type": ["string", "null"] },
+        "testCommand": { "$ref": "#/$defs/nullableCommand" }
+      }
+    },
+    "resolvedPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "source", "candidate", "consumers", "limits"],
+      "properties": {
+        "version": { "const": 1 },
+        "source": { "enum": ["github-action", "local-cli", "library"] },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["workingDirectory", "packageManager", "packageManagerVersion", "buildCommand"],
+          "properties": {
+            "workingDirectory": { "const": "." },
+            "packageManager": { "oneOf": [{ "enum": ["npm", "pnpm", "yarn"] }, { "type": "null" }] },
+            "packageManagerVersion": { "type": ["string", "null"] },
+            "buildCommand": { "$ref": "#/$defs/nullableCommand" }
+          }
+        },
+        "consumers": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 10,
+          "items": { "$ref": "#/$defs/resolvedPolicyConsumer" }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commandTimeoutSeconds", "wholeRunTimeoutSeconds", "generatedFileCountPerLane", "generatedBytesPerLane"],
+          "properties": {
+            "commandTimeoutSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+            "wholeRunTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 21600 },
+            "generatedFileCountPerLane": { "const": 2000 },
+            "generatedBytesPerLane": { "const": 104857600 }
+          }
+        }
       }
     }
   }

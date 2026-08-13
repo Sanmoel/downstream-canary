@@ -30,6 +30,42 @@ describe('configuration validation', () => {
     await expect(resolveRunConfig({ cwd: root })).rejects.toThrow(/array/);
   });
 
+  it('never reads candidate YAML when resolving trusted Action policy', async () => {
+    const root = await temporaryDirectory();
+    cleanups.push(root);
+    await writeFile(
+      `${root}/.downstream-canary.yml`,
+      `version: 1\ndefaults:\n  testCommand: [node, -e, process.exit(0)]\nconsumers:\n  - attacker/no-op@${SHA}\n`,
+    );
+    const config = await resolveRunConfig({
+      cwd: root,
+      configurationSource: 'none',
+      executionMode: 'github-action',
+      consumersText: `acme/tool@${SHA}`,
+    });
+    expect(config.consumers).toEqual([
+      {
+        repositoryUrl: 'https://github.com/acme/tool',
+        commit: SHA,
+        workingDirectory: '.',
+      },
+    ]);
+    expect(config.consumers[0]?.testCommand).toBeUndefined();
+  });
+
+  it('fails closed if Action policy attempts to supply a configuration path', async () => {
+    const root = await temporaryDirectory();
+    cleanups.push(root);
+    await expect(
+      resolveRunConfig({
+        cwd: root,
+        configurationSource: 'none',
+        configPath: '.downstream-canary.yml',
+        consumersText: `acme/tool@${SHA}`,
+      }),
+    ).rejects.toThrow(/not accepted by the GitHub Action/);
+  });
+
   it('rejects zero consumers and unknown configuration keys', async () => {
     const root = await temporaryDirectory();
     cleanups.push(root);
@@ -76,6 +112,21 @@ describe('configuration validation', () => {
       /defaults\.buildCommand is unsupported/,
     );
   });
+
+  it.each(['installCommand', 'lockfileCommand'])(
+    'rejects removed public manager override %s',
+    async (commandName) => {
+      const root = await temporaryDirectory();
+      cleanups.push(root);
+      await writeFile(
+        `${root}/.downstream-canary.yml`,
+        `version: 1\ndefaults:\n  ${commandName}: [npm, install]\nconsumers:\n  - acme/tool@${SHA}\n`,
+      );
+      await expect(resolveRunConfig({ cwd: root })).rejects.toThrow(
+        /unsupported key/,
+      );
+    },
+  );
 
   it('rejects a symbolic-link report directory before any host write', async () => {
     const root = await temporaryDirectory();

@@ -215,8 +215,6 @@ export function parseProjectOverrides(
     'packageManager',
     'packageManagerVersion',
     'lockfile',
-    'installCommand',
-    'lockfileCommand',
     'testCommand',
     'buildCommand',
   ]);
@@ -226,8 +224,6 @@ export function parseProjectOverrides(
     packageManager?: PackageManagerName;
     packageManagerVersion?: string;
     lockfile?: string;
-    installCommand?: CommandArray;
-    lockfileCommand?: CommandArray;
     testCommand?: CommandArray;
     buildCommand?: CommandArray;
   } = {};
@@ -261,8 +257,6 @@ export function parseProjectOverrides(
     result.lockfile = value.lockfile;
   }
   for (const commandName of [
-    'installCommand',
-    'lockfileCommand',
     'testCommand',
     'buildCommand',
   ] as const) {

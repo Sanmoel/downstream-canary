@@ -15,10 +15,11 @@ Thank you for helping improve Downstream Canary.
 Run the full gate before submitting a change:
 
 ```console
-npm ci
+npm ci --ignore-scripts --no-audit --no-fund
 npm run test:all
+npm audit --omit=dev --audit-level=moderate
 ```
 
 The Docker integration matrix is required for changes to execution, adapters, injection, reporting, fixtures, or security controls. Rebuild and commit `dist/`; `npm run check:dist` must prove it matches source.
 
-Use focused commits and explain security or compatibility tradeoffs. By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md). Contributions are accepted under Apache-2.0.
+Use focused commits and explain security or compatibility tradeoffs. Regenerate `THIRD_PARTY_NOTICES` when bundled dependencies change. By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md). Contributions are accepted under Apache-2.0.

@@ -101,19 +101,26 @@ describe('package-manager detection', () => {
     );
   });
 
-  it('rejects install overrides that bypass the exact manager or frozen contract', async () => {
+  it('rejects integrity-suffixed declarations until their bytes can be verified', async () => {
+    const path = await project(
+      {
+        packageManager: 'npm@11.17.0+sha256.deadbeef',
+        scripts: { test: 'node test.js' },
+      },
+      { 'package-lock.json': '{}' },
+    );
+    await expect(detectPackageManager(path, '.')).rejects.toThrow(
+      /integrity suffixes are rejected/,
+    );
+  });
+
+  it('rejects candidate-controlled .corepack.env files', async () => {
     const path = await project(
       { packageManager: 'npm@11.17.0', scripts: { test: 'node test.js' } },
       { 'package-lock.json': '{}' },
+      { '.corepack.env': 'COREPACK_DEFAULT_TO_LATEST=1\n' },
     );
-    await expect(
-      detectPackageManager(path, '.', { installCommand: ['npm', 'install'] }),
-    ).rejects.toThrow(/must invoke corepack npm@11\.17\.0/);
-    await expect(
-      detectPackageManager(path, '.', {
-        installCommand: ['corepack', 'npm@11.17.0', 'install'],
-      }),
-    ).rejects.toThrow(/frozen installation/);
+    await expect(detectPackageManager(path, '.')).rejects.toThrow(/\.corepack\.env/);
   });
 
   it('rejects private, authenticated, and non-registry lockfile sources', async () => {
